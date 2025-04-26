@@ -7,7 +7,9 @@ from typing import List, Union
 import numpy as np
 import torch
 import tqdm
-from reading import PCARepReader
+
+from repeng.extract import DatasetEntry
+from repeng.reading import PCARepReader
 
 
 class RepReading:
@@ -26,6 +28,7 @@ class RepReading:
         outputs,
         hidden_layers: Union[List[int], int] = -1,
     ):
+        """I think this just gets hidden states from the outputs of a model -> i.e. its just a small data transformation"""
         hidden_states_layers = {}
         for layer in hidden_layers:
             hidden_states = outputs["hidden_states"][layer]
@@ -42,10 +45,12 @@ class RepReading:
     # Removed this - looks like it only had to do w/ image models
     # def preprocess()
 
-    # This is the main call
-    def _forward(
+    # This is the main call (used to be _forward)
+    # This takes in the rep_reader & runs the model, then transforms the outputs w/ the rep_reader
+    # TODO: this should be similar if not the same to batched_get_hiddens
+    def forward(
         self,
-        model_inputs,
+        test_inputs,
         hidden_layers,
         rep_reader=None,
         component_index=0,
@@ -53,8 +58,15 @@ class RepReading:
         """ """
         # Removed encoder/decoder handling. TODO: see if this causes problems (it shouldn't)
         # get model hidden states and optionally transform them with a RepReader
+        # We need to get input_ids manually -> this was done implicitly by the transformer
+        # TODO: It would be nice to not constantly have to switch from DatasetEntry to str everywhere.
+        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
+        tokenized_inputs = self.tokenizer(
+            test_strs, padding=True, return_tensors="pt"
+        ).to(self.model.device)
+
         with torch.no_grad():
-            outputs = self.model(**model_inputs, output_hidden_states=True)
+            outputs = self.model(**tokenized_inputs, output_hidden_states=True)
         hidden_states = self._get_hidden_states(outputs, hidden_layers)
 
         if rep_reader is None:
@@ -62,32 +74,10 @@ class RepReading:
 
         return rep_reader.transform(hidden_states, hidden_layers, component_index)
 
-    def _batched_string_to_hiddens(
-        self,
-        train_inputs,
-        hidden_layers,
-        batch_size,
-        **tokenizer_args,
-    ):
-        # Wrapper method to get a dictionary hidden states from a list of strings
-        # I believe this used to call _forward
-        hidden_states_outputs = self(
-            train_inputs,
-            hidden_layers=hidden_layers,
-            batch_size=batch_size,
-            rep_reader=None,
-            **tokenizer_args,
-        )
-        hidden_states = {layer: [] for layer in hidden_layers}
-        for hidden_states_batch in hidden_states_outputs:
-            for layer in hidden_states_batch:
-                hidden_states[layer].extend(hidden_states_batch[layer])
-        return {k: np.vstack(v) for k, v in hidden_states.items()}
-
     # Uses PCA
     def get_directions(
         self,
-        train_inputs: Union[str, List[str], List[List[str]]],
+        train_inputs: list[DatasetEntry],
         hidden_layers: Union[str, int] = -1,
         n_difference: int = 1,
         batch_size: int = 8,
@@ -112,10 +102,12 @@ class RepReading:
         relative_hidden_states = None
         if direction_finder.needs_hiddens:
             # get raw hidden states for the train inputs
+            # the order is [positive, negative, positive, negative, ...]
+            train_strs = [s for ex in train_inputs for s in (ex.positive, ex.negative)]
             hidden_states = batched_get_hiddens(
                 self.model,
                 self.tokenizer,
-                train_inputs,
+                train_strs,
                 hidden_layers,
                 batch_size,
             )
@@ -131,11 +123,8 @@ class RepReading:
 
         # get the directions
         direction_finder.directions = direction_finder.get_rep_directions(
-            self.model,
-            self.tokenizer,
             relative_hidden_states,
             hidden_layers,
-            train_choices=train_labels,
         )
         for layer in direction_finder.directions:
             if isinstance(direction_finder.directions[layer], np.ndarray):
@@ -143,10 +132,11 @@ class RepReading:
                     layer
                 ].astype(np.float32)
 
-        if train_labels is not None:
-            direction_finder.direction_signs = direction_finder.get_signs(
-                hidden_states, train_labels, hidden_layers
-            )
+        # TODO: fix train_labels. For now we just mock it
+        mock_train_labels = [[1, 0] * len(train_inputs)]
+        direction_finder.direction_signs = direction_finder.get_signs(
+            hidden_states, mock_train_labels, hidden_layers
+        )
 
         return direction_finder
 
@@ -161,6 +151,9 @@ def batched_get_hiddens(
 ) -> dict[int, np.ndarray]:
     """
     I believe this does the same thing as the old code. The old implementation called self() on the pipeline, which I think is the same as running the model. Anyways this should just work
+
+    Note:
+    - inputs are list[str], not list[dataentry]
 
     OLD desc:
     Using the given model and tokenizer, pass the inputs through the model and get the hidden

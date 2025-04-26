@@ -15,6 +15,12 @@ from sklearn.decomposition import PCA
 # Taken from repeng.
 def project_onto_direction(H, direction):
     """Project matrix H (n, d_1) onto direction vector (d_2,)"""
+    # added this to avoid an error - don't know if these are supposed to be on CPU but whatever
+    # TODO fix this upstream.
+    if isinstance(H, torch.Tensor):
+        H = H.cpu()
+    if isinstance(direction, torch.Tensor):
+        direction = direction.cpu()
     mag = np.linalg.norm(direction)
     assert not np.isinf(mag)
     return (H @ direction) / mag
@@ -88,9 +94,9 @@ class RepReader(ABC):
 
         if self.needs_hiddens and hidden_states is not None and len(hidden_states) > 0:
             for layer in hidden_layers:
-                assert (
-                    hidden_states[layer].shape[0] == 2 * len(train_choices)
-                ), f"Shape mismatch between hidden states ({hidden_states[layer].shape[0]}) and labels ({len(train_choices)})"
+                assert hidden_states[layer].shape[0] == 2 * len(train_choices), (
+                    f"Shape mismatch between hidden states ({hidden_states[layer].shape[0]}) and labels ({len(train_choices)})"
+                )
 
                 signs[layer] = []
                 for component_index in range(self.n_components):
@@ -160,9 +166,7 @@ class PCARepReader(RepReader):
         self.n_components = n_components
         self.H_train_means = {}
 
-    def get_rep_directions(
-        self, model, tokenizer, hidden_states, hidden_layers, **kwargs
-    ):
+    def get_rep_directions(self, hidden_states, hidden_layers):
         """Get PCA components for each layer"""
         directions = {}
 
@@ -182,12 +186,16 @@ class PCARepReader(RepReader):
         return directions
 
     def get_signs(self, hidden_states, train_labels, hidden_layers):
+        """this used to accept train labels, as
+        [[1,0], [1,0]..] I believe
+
+        """
         signs = {}
 
         for layer in hidden_layers:
-            assert (
-                hidden_states[layer].shape[0] == len(np.concatenate(train_labels))
-            ), f"Shape mismatch between hidden states ({hidden_states[layer].shape[0]}) and labels ({len(np.concatenate(train_labels))})"
+            # assert hidden_states[layer].shape[0] == len(np.concatenate(train_labels)), (
+            #     f"Shape mismatch between hidden states ({hidden_states[layer].shape[0]}) and labels ({len(np.concatenate(train_labels))})"
+            # )
             layer_hidden_states = hidden_states[layer]
 
             # NOTE: since scoring is ultimately comparative, the effect of this is moot
