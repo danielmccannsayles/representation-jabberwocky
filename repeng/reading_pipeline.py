@@ -52,6 +52,7 @@ class RepReading:
         self,
         test_inputs,
         hidden_layers,
+        batch_size,
         rep_reader=None,
         component_index=0,
     ):
@@ -60,14 +61,20 @@ class RepReading:
         # get model hidden states and optionally transform them with a RepReader
         # We need to get input_ids manually -> this was done implicitly by the transformer
         # TODO: It would be nice to not constantly have to switch from DatasetEntry to str everywhere.
-        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
-        tokenized_inputs = self.tokenizer(
-            test_strs, padding=True, return_tensors="pt"
-        ).to(self.model.device)
 
-        with torch.no_grad():
-            outputs = self.model(**tokenized_inputs, output_hidden_states=True)
-        hidden_states = self._get_hidden_states(outputs, hidden_layers)
+        # TODO: I think that what they were doing earlier is analogous to batched_get_hiddens :D.
+        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
+        print(f"forward called w/ {len(test_strs)}")
+        # tokenized_inputs = self.tokenizer(
+        #     test_strs, padding=True, return_tensors="pt"
+        # ).to(self.model.device)
+
+        # with torch.no_grad():
+        #     outputs = self.model(**tokenized_inputs, output_hidden_states=True)
+        hidden_states = batched_get_hiddens(
+            self.model, self.tokenizer, test_strs, hidden_layers, batch_size
+        )
+        # hidden_states = self._get_hidden_states(outputs, hidden_layers)
 
         if rep_reader is None:
             return hidden_states
