@@ -1,6 +1,9 @@
 # Forked from https://github.com/vgel/repeng/
 
-I want to add the rep reading so I can tell what layers to intervene on when working on new models :D
+I want to add rep reading from the original paper, or at least show the graphs. Why? Idk, validation?
+
+
+
 
 # repeng
 
