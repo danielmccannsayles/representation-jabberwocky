@@ -2,7 +2,7 @@
 Continuing the same idea - recreate the old code. This will contain what used to be the rep_reading_pipeline
 """
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -53,6 +53,7 @@ class RepReading:
         batch_size,
         rep_reader=None,
         component_index=0,
+        rep_token: Optional[int] = None,
     ):
         """ """
         # Removed encoder/decoder handling. TODO: see if this causes problems (it shouldn't)
@@ -76,7 +77,7 @@ class RepReading:
         # with torch.no_grad():
         #     outputs = self.model(**tokenized_inputs, output_hidden_states=True)
         hidden_states = batched_get_hiddens(
-            self.model, self.tokenizer, test_strs, hidden_layers, batch_size
+            self.model, self.tokenizer, test_strs, hidden_layers, batch_size, rep_token
         )
         # hidden_states = self._get_hidden_states(outputs, hidden_layers)
 
@@ -159,12 +160,11 @@ def batched_get_hiddens(
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
+    rep_token: Optional[int] = None,
 ) -> dict[int, np.ndarray]:
     """
-    I believe this does the same thing as the old code. The old implementation called self() on the pipeline, which I think is the same as running the model. Anyways this should just work
-
-    Note:
-    - inputs are list[str], not list[dataentry]
+    Changed this to add a rep_token. This is necessary for the reader to work.
+    If no rep token is passed it defaults to False, and uses the last non padding index
 
     OLD desc:
     Using the given model and tokenizer, pass the inputs through the model and get the hidden
@@ -176,6 +176,7 @@ def batched_get_hiddens(
         inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
     ]
     hidden_states = {layer: [] for layer in hidden_layers}
+
     with torch.no_grad():
         for batch in tqdm.tqdm(batched_inputs):
             # get the last token, handling right padding if present
@@ -183,14 +184,18 @@ def batched_get_hiddens(
             encoded_batch = encoded_batch.to(model.device)
             out = model(**encoded_batch, output_hidden_states=True)
             attention_mask = encoded_batch["attention_mask"]
+
             for i in range(len(batch)):
+                # rep token calculation (-1 defaults to )
                 last_non_padding_index = (
                     attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
                 )
+                token_index = last_non_padding_index if rep_token is None else rep_token
+
                 for layer in hidden_layers:
                     hidden_idx = layer + 1 if layer >= 0 else layer
                     hidden_state = (
-                        out.hidden_states[hidden_idx][i][last_non_padding_index]
+                        out.hidden_states[hidden_idx][i][token_index]
                         .cpu()
                         .float()
                         .numpy()
