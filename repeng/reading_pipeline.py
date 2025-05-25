@@ -16,9 +16,6 @@ class RepReading:
     def __init__(self, model, tokenizer, **kwargs):
         super().__init__(**kwargs)
 
-        # No idea what this does, but it's used a fair amount
-        self.rep_token = -1
-
         # I added model & tokenizer - in the past they were implicitly passed in through the HF pipeline class. We use them in batched_get_hiddens, since we need to run the model & tokenizer
         self.model = model
         self.tokenizer = tokenizer
@@ -26,13 +23,14 @@ class RepReading:
     def _get_hidden_states(
         self,
         outputs,
+        rep_token=-1,
         hidden_layers: Union[List[int], int] = -1,
     ):
         """I think this just gets hidden states from the outputs of a model -> i.e. its just a small data transformation"""
         hidden_states_layers = {}
         for layer in hidden_layers:
             hidden_states = outputs["hidden_states"][layer]
-            hidden_states = hidden_states[:, self.rep_token, :].detach()
+            hidden_states = hidden_states[:, rep_token, :].detach()
             if hidden_states.dtype == torch.bfloat16:
                 hidden_states = hidden_states.float()
             hidden_states_layers[layer] = hidden_states.detach()
@@ -63,8 +61,14 @@ class RepReading:
         # TODO: It would be nice to not constantly have to switch from DatasetEntry to str everywhere.
 
         # TODO: I think that what they were doing earlier is analogous to batched_get_hiddens :D.
-        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
-        print(f"forward called w/ {len(test_strs)}")
+        if isinstance(test_inputs, list) and all(
+            isinstance(x, DatasetEntry) for x in test_inputs
+        ):
+            test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
+
+        else:  # assume list of strings
+            test_strs = test_inputs
+        # print(f"forward called w/ {len(test_strs)}")
         # tokenized_inputs = self.tokenizer(
         #     test_strs, padding=True, return_tensors="pt"
         # ).to(self.model.device)
