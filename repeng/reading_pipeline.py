@@ -9,7 +9,7 @@ import torch
 import tqdm
 
 from repeng.extract import DatasetEntry
-from repeng.reading import PCARepReader
+from repeng.reader import PCARepReader
 
 
 class RepReading:
