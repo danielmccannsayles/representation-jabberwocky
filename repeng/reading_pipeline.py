@@ -2,7 +2,7 @@
 Continuing the same idea - recreate the old code. This will contain what used to be the rep_reading_pipeline
 """
 
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -13,96 +13,21 @@ from repeng.extract import DatasetEntry
 from repeng.reader import PCARepReader
 
 
-class RepReading:
-    def __init__(self, model, tokenizer, **kwargs):
-        super().__init__(**kwargs)
-
-        # I added model & tokenizer - in the past they were implicitly passed in through the HF pipeline class. We use them in batched_get_hiddens, since we need to run the model & tokenizer
-        self.model = model
-        self.tokenizer = tokenizer
-
-    def _get_hidden_states(
-        self,
-        outputs,
-        rep_token=-1,
-        hidden_layers: Union[List[int], int] = -1,
-    ):
-        """I think this just gets hidden states from the outputs of a model -> i.e. its just a small data transformation"""
-        hidden_states_layers = {}
-        for layer in hidden_layers:
-            hidden_states = outputs["hidden_states"][layer]
-            hidden_states = hidden_states[:, rep_token, :].detach()
-            if hidden_states.dtype == torch.bfloat16:
-                hidden_states = hidden_states.float()
-            hidden_states_layers[layer] = hidden_states.detach()
-
-        return hidden_states_layers
-
-    # Removed this - kept for posterity
-    # def _sanitize_parameters()
-
-    # Removed this - looks like it only had to do w/ image models
-    # def preprocess()
-
-    # This is the main call (used to be _forward)
-    # This takes in the rep_reader & runs the model, then transforms the outputs w/ the rep_reader
-    # TODO: this should be similar if not the same to batched_get_hiddens
-    def forward(
-        self,
-        test_inputs,
-        hidden_layers,
-        batch_size,
-        rep_reader=None,
-        component_index=0,
-        rep_token: Optional[int] = None,
-    ):
-        """ """
-        # Removed encoder/decoder handling. TODO: see if this causes problems (it shouldn't)
-        # get model hidden states and optionally transform them with a RepReader
-        # We need to get input_ids manually -> this was done implicitly by the transformer
-        # TODO: It would be nice to not constantly have to switch from DatasetEntry to str everywhere.
-
-        # TODO: I think that what they were doing earlier is analogous to batched_get_hiddens :D.
-        if isinstance(test_inputs, list) and all(
-            isinstance(x, DatasetEntry) for x in test_inputs
-        ):
-            test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
-
-        else:  # assume list of strings
-            test_strs = test_inputs
-
-        tokenized_inputs = self.tokenizer(
-            test_strs, padding=True, return_tensors="pt"
-        ).to(self.model.device)
-
-        with torch.no_grad():
-            outputs = self.model(**tokenized_inputs, output_hidden_states=True)
-
-        hidden_states = self._get_hidden_states(outputs, rep_token, hidden_layers)
-
-        # TODO: can we use the batched_get_hiddens?
-        # hidden_states = batched_get_hiddens(
-        #     self.model, self.tokenizer, test_strs, hidden_layers, batch_size, rep_token
-        # )
-
-        if rep_reader is None:
-            return hidden_states
-
-        return rep_reader.transform(hidden_states, hidden_layers, component_index)
-
-
-# Taken from repeng
-def batched_get_hiddens(
+# Taken from repeng, slightly modified
+def batched_get_hiddens2(
     model: PreTrainedModel,
     tokenizer,
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
     rep_token: Optional[int] = None,
+    hide_progress: Optional[bool] = None,
 ) -> dict[int, np.ndarray]:
     """
     Changed this to add a rep_token. This is necessary when reading w/ the reader (getting H_test).
     If no rep token is passed it defaults to False, and uses the last non padding index
+
+    Also added hide_progress flag
 
     Using the given model and tokenizer, pass the inputs through the model and get the hidden
     states for each layer in `hidden_layers` for the last token.
@@ -115,7 +40,7 @@ def batched_get_hiddens(
     hidden_states = {layer: [] for layer in hidden_layers}
 
     with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs):
+        for batch in tqdm.tqdm(batched_inputs, disable=hide_progress):
             # get the last token, handling right padding if present
             encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
             encoded_batch = encoded_batch.to(model.device)
@@ -142,10 +67,43 @@ def batched_get_hiddens(
     return {k: np.vstack(v) for k, v in hidden_states.items()}
 
 
+# TODO: can we do this in an actual batch? ALso how is it even used in the code?
+def rep_read(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    test_inputs: Union[list[str], list[DatasetEntry]],
+    hidden_layers,
+    batch_size,
+    rep_reader: PCARepReader,
+    component_index=0,
+    rep_token: Optional[int] = None,
+):
+    """Formerly 'forward' on the pipeline. Takes in some input, runs it through the model, uses the rep_reader on it."""
+    if isinstance(test_inputs, list) and all(
+        isinstance(x, DatasetEntry) for x in test_inputs
+    ):
+        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
+
+    else:  # assume list of strings
+        test_strs = test_inputs
+
+    hidden_states = batched_get_hiddens2(
+        model,
+        tokenizer,
+        test_strs,
+        hidden_layers,
+        batch_size,
+        rep_token,
+        hide_progress=True,
+    )
+
+    return rep_reader.transform(hidden_states, hidden_layers, component_index)
+
+
 #### Consolidated version
 def create_rep_reader(
     model: PreTrainedModel,
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     hidden_layers: list[int],
     train_inputs: list[DatasetEntry],
     n_difference: int = 1,
@@ -169,7 +127,7 @@ def create_rep_reader(
     relative_hidden_states = None
 
     # get raw hidden states for the train inputs
-    hidden_states = batched_get_hiddens(
+    hidden_states = batched_get_hiddens2(
         model,
         tokenizer,
         train_strs,
