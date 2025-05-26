@@ -69,17 +69,20 @@ class RepReading:
 
         else:  # assume list of strings
             test_strs = test_inputs
-        # print(f"forward called w/ {len(test_strs)}")
-        # tokenized_inputs = self.tokenizer(
-        #     test_strs, padding=True, return_tensors="pt"
-        # ).to(self.model.device)
 
-        # with torch.no_grad():
-        #     outputs = self.model(**tokenized_inputs, output_hidden_states=True)
-        hidden_states = batched_get_hiddens(
-            self.model, self.tokenizer, test_strs, hidden_layers, batch_size, rep_token
-        )
-        # hidden_states = self._get_hidden_states(outputs, hidden_layers)
+        tokenized_inputs = self.tokenizer(
+            test_strs, padding=True, return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model(**tokenized_inputs, output_hidden_states=True)
+
+        hidden_states = self._get_hidden_states(outputs, rep_token, hidden_layers)
+
+        # TODO: can we use the batched_get_hiddens?
+        # hidden_states = batched_get_hiddens(
+        #     self.model, self.tokenizer, test_strs, hidden_layers, batch_size, rep_token
+        # )
 
         if rep_reader is None:
             return hidden_states
@@ -145,10 +148,11 @@ class RepReading:
                 ].astype(np.float32)
 
         # TODO: fix train_labels. For now we just mock it
-        mock_train_labels = [[1, 0] * len(train_inputs)]
-        direction_finder.direction_signs = direction_finder.get_signs(
+        mock_train_labels = [[1, 0] for _ in train_inputs]
+        signs = direction_finder.get_signs(
             hidden_states, mock_train_labels, hidden_layers
         )
+        direction_finder.direction_signs = signs
 
         return direction_finder
 
@@ -204,3 +208,115 @@ def batched_get_hiddens(
             del out
 
     return {k: np.vstack(v) for k, v in hidden_states.items()}
+
+
+#### NEW stuff
+
+
+### I'm going to flatten this pipeline into a few functions and get it working correctly
+def get_hidden_states(
+    outputs,
+    rep_token=-1,
+    hidden_layers: Union[List[int], int] = -1,
+):
+    hidden_states_layers = {}
+    for layer in hidden_layers:
+        hidden_states = outputs["hidden_states"][layer]
+        hidden_states = hidden_states[:, rep_token, :].detach()
+        if hidden_states.dtype == torch.bfloat16:
+            hidden_states = hidden_states.float()
+        hidden_states_layers[layer] = hidden_states.detach()
+
+    return hidden_states_layers
+
+
+def string_to_hiddens(
+    model,
+    tokenizer,
+    train_strs,
+    rep_token,
+    hidden_layers,
+    batch_size,
+):
+    """Have to manually preprocess & batch & call"""
+    hidden_states = {layer: [] for layer in hidden_layers}
+
+    for start in range(0, len(train_strs), batch_size):
+        batch_inputs = train_strs[start : start + batch_size]
+
+        toks = tokenizer(
+            batch_inputs,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model(**toks, output_hidden_states=True)
+
+        batch_hiddens = get_hidden_states(outputs, rep_token, hidden_layers)
+
+        for layer in hidden_layers:
+            # .cpu() so we don’t pin GPU memory; .numpy() for consistency
+            hidden_states[layer].append(batch_hiddens[layer].cpu().numpy())
+
+    # concatenate the pieces exactly the same way the pipeline helper did
+    return {layer: np.vstack(chunks) for layer, chunks in hidden_states.items()}
+
+
+def create_rep_reader(
+    model,
+    tokenizer,
+    train_inputs: list[DatasetEntry],
+    rep_token: int = -1,
+    hidden_layers: Union[str, int] = -1,
+    n_difference: int = 1,
+    batch_size: int = 8,
+):
+    if not isinstance(hidden_layers, list):
+        assert isinstance(hidden_layers, int)
+        hidden_layers = [hidden_layers]
+
+    direction_finder = PCARepReader()
+
+    # PCA needs hidden state data for training set
+    hidden_states = None
+    relative_hidden_states = None
+
+    train_strs = [s for ex in train_inputs for s in (ex.positive, ex.negative)]
+    # get raw hidden states for the train inputs
+    hidden_states = string_to_hiddens(
+        model,
+        tokenizer,
+        train_strs,
+        rep_token,
+        hidden_layers,
+        batch_size,
+    )
+
+    # get differences between pairs
+    relative_hidden_states = {k: np.copy(v) for k, v in hidden_states.items()}
+    for layer in hidden_layers:
+        for _ in range(n_difference):
+            relative_hidden_states[layer] = (
+                relative_hidden_states[layer][::2] - relative_hidden_states[layer][1::2]
+            )
+
+    # get the directions
+    direction_finder.directions = direction_finder.get_rep_directions(
+        relative_hidden_states,
+        hidden_layers,
+    )
+    for layer in direction_finder.directions:
+        if type(direction_finder.directions[layer]) == np.ndarray:
+            direction_finder.directions[layer] = direction_finder.directions[
+                layer
+            ].astype(np.float32)
+
+        # TODO: fix train_labels. For now we just mock it
+        mock_train_labels = [[1, 0] for _ in train_inputs]
+    direction_finder.direction_signs = direction_finder.get_signs(
+        hidden_states, mock_train_labels, hidden_layers
+    )
+
+    return direction_finder
