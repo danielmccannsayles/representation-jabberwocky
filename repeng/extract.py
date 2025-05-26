@@ -2,6 +2,7 @@ import dataclasses
 import os
 import typing
 import warnings
+from typing import Optional
 
 import gguf
 import numpy as np
@@ -18,6 +19,10 @@ from .saes import Sae
 class DatasetEntry:
     positive: str
     negative: str
+    flip: Optional[
+        bool
+    ]  # If true, flip the data. Used in training to avoid overfitting to pairs
+    # TODO: This is necessary for the rep reader - is it necessary for control?
 
 
 @dataclasses.dataclass

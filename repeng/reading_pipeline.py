@@ -273,6 +273,17 @@ def create_rep_reader(
     n_difference: int = 1,
     batch_size: int = 8,
 ):
+    train_strs = []
+    train_labels = []
+    for input in train_inputs:
+        # TODO: simplify this LOL.
+        if input.flip:
+            train_strs += [input.negative, input.positive]
+            train_labels.append([False, True])
+        else:
+            train_strs += [input.positive, input.negative]
+            train_labels.append([True, False])
+
     if not isinstance(hidden_layers, list):
         assert isinstance(hidden_layers, int)
         hidden_layers = [hidden_layers]
@@ -283,7 +294,6 @@ def create_rep_reader(
     hidden_states = None
     relative_hidden_states = None
 
-    train_strs = [s for ex in train_inputs for s in (ex.positive, ex.negative)]
     # get raw hidden states for the train inputs
     hidden_states = string_to_hiddens(
         model,
@@ -313,10 +323,8 @@ def create_rep_reader(
                 layer
             ].astype(np.float32)
 
-        # TODO: fix train_labels. For now we just mock it
-        mock_train_labels = [[1, 0] for _ in train_inputs]
     direction_finder.direction_signs = direction_finder.get_signs(
-        hidden_states, mock_train_labels, hidden_layers
+        hidden_states, train_labels, hidden_layers
     )
 
     return direction_finder
