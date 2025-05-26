@@ -7,6 +7,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 import tqdm
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from repeng.extract import DatasetEntry
 from repeng.reader import PCARepReader
@@ -159,7 +160,7 @@ class RepReading:
 
 # Taken from repeng
 def batched_get_hiddens(
-    model,
+    model: PreTrainedModel,
     tokenizer,
     inputs: list[str],
     hidden_layers: list[int],
@@ -210,83 +211,74 @@ def batched_get_hiddens(
     return {k: np.vstack(v) for k, v in hidden_states.items()}
 
 
-#### NEW stuff
+#### Consolidated version
 
 
 ### I'm going to flatten this pipeline into a few functions and get it working correctly
-def get_hidden_states(
-    outputs,
-    rep_token=-1,
-    hidden_layers: Union[List[int], int] = -1,
-):
-    hidden_states_layers = {}
-    for layer in hidden_layers:
-        hidden_states = outputs["hidden_states"][layer]
-        hidden_states = hidden_states[:, rep_token, :].detach()
-        if hidden_states.dtype == torch.bfloat16:
-            hidden_states = hidden_states.float()
-        hidden_states_layers[layer] = hidden_states.detach()
-
-    return hidden_states_layers
-
-
 def string_to_hiddens(
-    model,
-    tokenizer,
-    train_strs,
-    rep_token,
-    hidden_layers,
-    batch_size,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    train_strs: list[str],
+    hidden_layers: list[int],
+    batch_size: int,
+    rep_token: int = -1,
 ):
-    """Have to manually preprocess & batch & call"""
+    """Batch inputs
+    Tokenize them & run them through the model to get the hidden states
+
+    I should be able to re-use this code, or combine it with the batched_get_hiddens.
+
+    The rep_token is not used at all by create_rep_reader FYI
+    """
     hidden_states = {layer: [] for layer in hidden_layers}
 
     for start in range(0, len(train_strs), batch_size):
-        batch_inputs = train_strs[start : start + batch_size]
-
+        # Tokenize the batch of train strings
         toks = tokenizer(
-            batch_inputs,
+            train_strs[start : start + batch_size],
             return_tensors="pt",
             padding=True,
-            truncation=True,
         ).to(model.device)
 
+        # Get hidden states from model
         with torch.no_grad():
-            outputs = model(**toks, output_hidden_states=True)
+            hs = model(**toks, output_hidden_states=True)["hidden_states"]
 
-        batch_hiddens = get_hidden_states(outputs, rep_token, hidden_layers)
+        # Add hidden states
+        # We go through the hidden layers
+        # Get the hidden states for that layer
+        # Shrink it down to the rep token ->
+        # Convert it to float()
 
         for layer in hidden_layers:
-            # .cpu() so we don’t pin GPU memory; .numpy() for consistency
-            hidden_states[layer].append(batch_hiddens[layer].cpu().numpy())
+            layer_hiddens = hs[layer][
+                :, rep_token, :
+            ].detach()  # Only care about the hidden states rep_token->
+            if layer_hiddens.dtype == torch.bfloat16:
+                layer_hiddens = layer_hiddens.float()
+            hidden_states[layer].append(layer_hiddens.detach().cpu().numpy())
 
-    # concatenate the pieces exactly the same way the pipeline helper did
     return {layer: np.vstack(chunks) for layer, chunks in hidden_states.items()}
 
 
 def create_rep_reader(
-    model,
+    model: PreTrainedModel,
     tokenizer,
+    hidden_layers: list[int],
     train_inputs: list[DatasetEntry],
-    rep_token: int = -1,
-    hidden_layers: Union[str, int] = -1,
     n_difference: int = 1,
     batch_size: int = 8,
 ):
+    # Turn inputs into train & labels
     train_strs = []
     train_labels = []
     for input in train_inputs:
-        # TODO: simplify this LOL.
         if input.flip:
             train_strs += [input.negative, input.positive]
             train_labels.append([False, True])
         else:
             train_strs += [input.positive, input.negative]
             train_labels.append([True, False])
-
-    if not isinstance(hidden_layers, list):
-        assert isinstance(hidden_layers, int)
-        hidden_layers = [hidden_layers]
 
     direction_finder = PCARepReader()
 
@@ -299,7 +291,6 @@ def create_rep_reader(
         model,
         tokenizer,
         train_strs,
-        rep_token,
         hidden_layers,
         batch_size,
     )
