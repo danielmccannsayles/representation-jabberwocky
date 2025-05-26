@@ -2,7 +2,7 @@
 Continuing the same idea - recreate the old code. This will contain what used to be the rep_reading_pipeline
 """
 
-from typing import Optional, Union
+from typing import Optional
 
 import numpy as np
 import torch
@@ -67,40 +67,65 @@ def batched_get_hiddens2(
     return {k: np.vstack(v) for k, v in hidden_states.items()}
 
 
-# TODO: can we do this in an actual batch? ALso how is it even used in the code?
+# TODO: can we do this in an actual batch? / Just better?? !
 def rep_read(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
-    test_inputs: Union[list[str], list[DatasetEntry]],
+    input: str,
     hidden_layers,
+    mean_layers: range,
     batch_size,
     rep_reader: PCARepReader,
     component_index=0,
-    rep_token: Optional[int] = None,
 ):
-    """Formerly 'forward' on the pipeline. Takes in some input, runs it through the model, uses the rep_reader on it."""
-    if isinstance(test_inputs, list) and all(
-        isinstance(x, DatasetEntry) for x in test_inputs
-    ):
-        test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
+    """
+    Reads a string.
+    Goes through it and gets an h_test for each token ->. Then calculates scores according to rep_reader.
+    Incorporates 'forward' on the pipeline. Takes in some input, runs it through the model, uses the rep_reader on it."""
 
-    else:  # assume list of strings
-        test_strs = test_inputs
+    input_ids = tokenizer.tokenize(input)
+    results = []
 
-    hidden_states = batched_get_hiddens2(
-        model,
-        tokenizer,
-        test_strs,
-        hidden_layers,
-        batch_size,
-        rep_token,
-        hide_progress=True,
-    )
+    # For each position (token index) we need to make H_tests
+    for pos in range(len(input_ids)):
+        rep_token = -len(input_ids) + pos
 
-    return rep_reader.transform(hidden_states, hidden_layers, component_index)
+        hidden_states = batched_get_hiddens2(
+            model,
+            tokenizer,
+            inputs=[input],
+            hidden_layers=hidden_layers,
+            batch_size=batch_size,
+            rep_token=rep_token,
+            hide_progress=True,
+        )
+
+        H_tests = rep_reader.transform(hidden_states, hidden_layers, component_index)
+
+        results.append(H_tests)
+
+    # Turn results into the scores & the mean scores
+    scores = []
+    score_means = []
+    for result in results:
+        mean_scores = []
+        normal_scores = []
+        for layer in hidden_layers:
+            normal_scores.append(
+                result[layer][0] * rep_reader.direction_signs[layer][0]
+            )
+
+            if layer in mean_layers:
+                mean_scores.append(
+                    result[layer][0] * rep_reader.direction_signs[layer][0]
+                )
+
+        scores.append(normal_scores)
+        score_means.append(np.mean(mean_scores))
+
+    return (input_ids, scores, score_means)
 
 
-#### Consolidated version
 def create_rep_reader(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -109,6 +134,7 @@ def create_rep_reader(
     n_difference: int = 1,
     batch_size: int = 8,
 ):
+    """Creates a rep_reader and initializes it sort of"""
     # Turn inputs into train & labels
     train_strs = []
     train_labels = []
