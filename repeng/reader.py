@@ -34,19 +34,31 @@ def recenter(x, mean=None):
 
 
 class PCARepReader:
-    def __init__(self, n_components=1):
+    def __init__(self, hidden_layers: list[int], n_components=1):
         super().__init__()
         self.n_components = n_components
-        # TODO: what are h_train_means??
+        # These h_train_means are used in transform. I think these are like the
         self.H_train_means = {}
 
-        # TODO: add hidden_states, directions, direction signs
+        # Directions are used in get_signs and in transform
+        self._directions = {}
 
-    def get_rep_directions(self, hidden_states, hidden_layers):
+        # Direction suigns are used
+        self._direction_signs = {}
+
+        # This is used a lot but is always the same
+        self._hidden_layers = hidden_layers
+
+    @property
+    def direction_signs(self):
+        """Used externally by rep_read()"""
+        return self._direction_signs
+
+    def get_rep_directions(self, hidden_states):
         """Get PCA components for each layer"""
         directions = {}
 
-        for layer in hidden_layers:
+        for layer in self._hidden_layers:
             H_train = hidden_states[layer]
             H_train_mean = H_train.mean(axis=0, keepdims=True)
             self.H_train_means[layer] = H_train_mean
@@ -59,12 +71,17 @@ class PCARepReader:
             )  # shape (n_components, n_features)
             self.n_components = pca_model.n_components_
 
-        return directions
+        # Brought this over from the pipeline. Should consolidate it into the above code??
+        for layer in directions:
+            if isinstance(directions[layer], np.ndarray):
+                directions[layer] = directions[layer].astype(np.float32)
 
-    def get_signs(self, hidden_states, train_labels, hidden_layers):
+        self._directions = directions
+
+    def get_signs(self, hidden_states, train_labels):
         signs = {}
 
-        for layer in hidden_layers:
+        for layer in self._hidden_layers:
             assert (
                 hidden_states[layer].shape[0] == len(np.concatenate(train_labels))
             ), f"Shape mismatch between hidden states ({hidden_states[layer].shape[0]}) and labels ({len(np.concatenate(train_labels))})"
@@ -80,7 +97,7 @@ class PCARepReader:
             layer_signs = np.zeros(self.n_components)
             for component_index in range(self.n_components):
                 transformed_hidden_states = project_onto_direction(
-                    layer_hidden_states, self.directions[layer][component_index]
+                    layer_hidden_states, self._directions[layer][component_index]
                 ).cpu()
 
                 pca_outputs_comp = [
@@ -118,14 +135,13 @@ class PCARepReader:
 
             signs[layer] = layer_signs
 
-        return signs
+        self._direction_signs = signs
 
-    def transform(self, hidden_states, hidden_layers, component_index):
+    def transform(self, hidden_states, component_index):
         """Project the hidden states onto the concept directions in self.directions
 
         Args:
             hidden_states: dictionary with entries of dimension (n_examples, hidden_size)
-            hidden_layers: list of layers to consider
             component_index: index of the component to use from self.directions
 
         Returns:
@@ -134,7 +150,7 @@ class PCARepReader:
 
         assert component_index < self.n_components
         transformed_hidden_states = {}
-        for layer in hidden_layers:
+        for layer in self._hidden_layers:
             layer_hidden_states = hidden_states[layer]
 
             if hasattr(self, "H_train_means"):
@@ -144,7 +160,7 @@ class PCARepReader:
 
             # project hidden states onto found concept directions (e.g. onto PCA comp 0)
             H_transformed = project_onto_direction(
-                layer_hidden_states, self.directions[layer][component_index]
+                layer_hidden_states, self._directions[layer][component_index]
             )
             transformed_hidden_states[layer] = H_transformed.cpu().numpy()
         return transformed_hidden_states

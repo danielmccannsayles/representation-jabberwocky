@@ -100,7 +100,7 @@ def rep_read(
             hide_progress=True,
         )
 
-        H_tests = rep_reader.transform(hidden_states, hidden_layers, component_index)
+        H_tests = rep_reader.transform(hidden_states, component_index)
 
         results.append(H_tests)
 
@@ -146,13 +146,8 @@ def create_rep_reader(
             train_strs += [input.positive, input.negative]
             train_labels.append([True, False])
 
-    direction_finder = PCARepReader()
-
-    # PCA needs hidden state data for training set
-    hidden_states = None
-    relative_hidden_states = None
-
-    # get raw hidden states for the train inputs
+    # PCA needs hidden state data!
+    # get hidden states for the train inputs
     hidden_states = batched_get_hiddens2(
         model,
         tokenizer,
@@ -169,19 +164,11 @@ def create_rep_reader(
                 relative_hidden_states[layer][::2] - relative_hidden_states[layer][1::2]
             )
 
-    # get the directions
-    direction_finder.directions = direction_finder.get_rep_directions(
-        relative_hidden_states,
-        hidden_layers,
-    )
-    for layer in direction_finder.directions:
-        if type(direction_finder.directions[layer]) == np.ndarray:
-            direction_finder.directions[layer] = direction_finder.directions[
-                layer
-            ].astype(np.float32)
+    # Initialize and 'train' rep reader
+    rep_reader = PCARepReader(hidden_layers=hidden_layers)
 
-    direction_finder.direction_signs = direction_finder.get_signs(
-        hidden_states, train_labels, hidden_layers
-    )
+    rep_reader.get_rep_directions(relative_hidden_states)
 
-    return direction_finder
+    rep_reader.get_signs(hidden_states, train_labels)
+
+    return rep_reader
