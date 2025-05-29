@@ -19,9 +19,8 @@ from .saes import Sae
 class DatasetEntry:
     positive: str
     negative: str
-    flip: Optional[
-        bool
-    ]  # If true, flip the data. Used in training to avoid overfitting to pairs
+    flip: Optional[bool]
+    # If true, flip the data. Used in training to avoid overfitting to pairs
     # TODO: This is necessary for the rep reader - is it necessary for control?
 
 
@@ -36,9 +35,8 @@ class ControlVector:
         model: "PreTrainedModel | ControlModel",
         tokenizer: PreTrainedTokenizerBase,
         dataset: list[DatasetEntry],
-        test_inputs: list[DatasetEntry] | None = None,
         **kwargs,
-    ):
+    ) -> "ControlVector":
         """
         Train a ControlVector for a given model and tokenizer using the provided dataset.
 
@@ -56,14 +54,13 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs, accuracy_scores = read_representations(
+            dirs = read_representations(
                 model,
                 tokenizer,
                 dataset,
-                test_inputs,
                 **kwargs,
             )
-        return cls(model_type=model.config.model_type, directions=dirs), accuracy_scores
+        return cls(model_type=model.config.model_type, directions=dirs)
 
     @classmethod
     def train_with_sae(
@@ -250,15 +247,14 @@ class ControlVector:
 def read_representations(
     model: "PreTrainedModel | ControlModel",
     tokenizer: PreTrainedTokenizerBase,
-    train_inputs: list[DatasetEntry],
-    test_inputs: list[DatasetEntry],
+    inputs: list[DatasetEntry],
     hidden_layers: typing.Iterable[int] | None = None,
     batch_size: int = 32,
-    method: typing.Literal["pca_diff", "pca_center", "umap"] = "pca_center",
+    method: typing.Literal["pca_diff", "pca_center", "umap"] = "pca_diff",
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
-) -> tuple[dict[int, np.ndarray], dict[int, float]]:
+) -> dict[int, np.ndarray]:
     """
     Extract the representations based on the contrast dataset.
     """
@@ -270,7 +266,7 @@ def read_representations(
     hidden_layers = [i if i >= 0 else n_layers + i for i in hidden_layers]
 
     # the order is [positive, negative, positive, negative, ...]
-    train_strs = [s for ex in train_inputs for s in (ex.positive, ex.negative)]
+    train_strs = [s for ex in inputs for s in (ex.positive, ex.negative)]
 
     layer_hiddens = batched_get_hiddens(
         model, tokenizer, train_strs, hidden_layers, batch_size
@@ -279,17 +275,11 @@ def read_representations(
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    # Added layer_means & direction_signs for reading purposes
-    layer_means = {}
-    direction_signs = {}
+    # get directions for each layer using PCA
     directions: dict[int, np.ndarray] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
-
-        # Store this for recentering
-        layer_means[layer] = h.mean(axis=0, keepdims=True)
-
-        assert h.shape[0] == len(train_inputs) * 2
+        assert h.shape[0] == len(inputs) * 2
 
         if method == "pca_diff":
             train = h[::2] - h[1::2]
@@ -316,58 +306,27 @@ def read_representations(
             embedding = umap_model.fit_transform(train).astype(np.float32)
             directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
 
-        # Change to recenter - not necessary for determining the direction, but good for building a plot
-        # h_recentered = h - layer_means[layer]
-        projected = project_onto_direction(h, directions[layer])
+        # calculate sign
+        projected_hiddens = project_onto_direction(h, directions[layer])
 
-        # Determine sign
+        # order is [positive, negative, positive, negative, ...]
         positive_smaller_mean = np.mean(
             [
-                projected[i] < projected[i + 1]
-                for i in range(0, len(train_inputs) * 2, 2)
+                projected_hiddens[i] < projected_hiddens[i + 1]
+                for i in range(0, len(inputs) * 2, 2)
             ]
         )
         positive_larger_mean = np.mean(
             [
-                projected[i] > projected[i + 1]
-                for i in range(0, len(train_inputs) * 2, 2)
+                projected_hiddens[i] > projected_hiddens[i + 1]
+                for i in range(0, len(inputs) * 2, 2)
             ]
         )
 
-        # Store signs to use in a sec
-        sign = -1 if positive_smaller_mean > positive_larger_mean else 1
-        directions[layer] *= sign
-        direction_signs[layer] = sign
+        if positive_smaller_mean > positive_larger_mean:  # type: ignore
+            directions[layer] *= -1
 
-    # TODO: clean this up
-    # Calculate accuracy scores for layers so we can get a graph of layers to intervene on
-
-    test_inputs = test_inputs or train_inputs
-    test_strs = [s for ex in test_inputs for s in (ex.positive, ex.negative)]
-    test_hiddens = batched_get_hiddens(
-        model, tokenizer, test_strs, hidden_layers, batch_size
-    )
-
-    # Calculate accuracy scores
-    accuracy_scores = {}
-    for layer in hidden_layers:
-        # Apply same transformation as in transform()
-        test_centered = test_hiddens[layer] - layer_means[layer]
-        test_projected = project_onto_direction(test_centered, directions[layer])
-
-        # Group into pairs
-        test_pairs = [
-            test_projected[i : i + 2] for i in range(0, len(test_projected), 2)
-        ]
-
-        # Use sign to select min or max
-        eval_func = min if direction_signs[layer] == -1 else max
-
-        # Calculate accuracy
-        accuracy = np.mean([eval_func(pair) == pair[0] for pair in test_pairs])
-        accuracy_scores[layer] = float(accuracy)
-
-    return directions, accuracy_scores
+    return directions
 
 
 def batched_get_hiddens(
