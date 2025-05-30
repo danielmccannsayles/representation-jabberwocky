@@ -72,14 +72,17 @@ def batched_get_hiddens2(
 
 # Taken from repeng.
 def project_onto_direction(H, direction):
-    """Project matrix H (n, d_1) onto direction vector (d_2,)"""
+    """Project matrix H (n, d_1) onto direction vector (d_2,).
+
+    Returns np"""
     # added this to avoid an error - don't know if these are supposed to be on CPU but whatever
     # TODO fix this upstream.
     if isinstance(H, torch.Tensor):
-        H = H.cpu()
+        H = H.cpu().numpy()
     if isinstance(direction, torch.Tensor):
-        direction = direction.cpu()
+        direction = direction.cpu().numpy()
     mag = np.linalg.norm(direction)
+    print(f"multiplying {H.shape} by {direction.shape}, dividing by {mag.shape}")
     assert not np.isinf(mag)
     return (H @ direction) / mag
 
@@ -165,7 +168,7 @@ class PCARepReader:
             for component_index in range(self.n_components):
                 transformed_hidden_states = project_onto_direction(
                     layer_hidden_states, self._directions[layer][component_index]
-                ).cpu()
+                )
 
                 pca_outputs_comp = [
                     list(
@@ -204,18 +207,11 @@ class PCARepReader:
         self._direction_signs = signs
 
     def transform(self, hidden_states, component_index):
-        """Project the hidden states onto the concept directions in self.directions
-
-        Args:
-            hidden_states: dictionary with entries of dimension (n_examples, hidden_size)
-            component_index: index of the component to use from self.directions
-
-        Returns:
-            transformed_hidden_states: dictionary with entries of dimension (n_examples,)
-        """
+        """Transform uses the directions. Direction signs are added on later"""
 
         assert component_index < self.n_components
         transformed_hidden_states = {}
+
         for layer in self._hidden_layers:
             layer_hidden_states = hidden_states[layer]
 
@@ -225,10 +221,11 @@ class PCARepReader:
                 )
 
             # project hidden states onto found concept directions (e.g. onto PCA comp 0)
+            print(self._directions[layer][component_index])
             H_transformed = project_onto_direction(
-                layer_hidden_states, self._directions[layer][component_index]
+                layer_hidden_states, self._directions[layer]
             )
-            transformed_hidden_states[layer] = H_transformed.cpu().numpy()
+            transformed_hidden_states[layer] = H_transformed
         return transformed_hidden_states
 
     def read(
@@ -271,12 +268,10 @@ class PCARepReader:
             mean_scores = []
             normal_scores = []
             for layer in self._hidden_layers:
-                normal_scores.append(result[layer][0] * self._direction_signs[layer][0])
+                normal_scores.append(result[layer][0] * self._direction_signs[layer])
 
                 if layer in mean_layers:
-                    mean_scores.append(
-                        result[layer][0] * self._direction_signs[layer][0]
-                    )
+                    mean_scores.append(result[layer][0] * self._direction_signs[layer])
 
             scores.append(normal_scores)
             score_means.append(np.mean(mean_scores))

@@ -269,21 +269,17 @@ def read_representations(
     n_layers = len(model_layer_list(model))
     hidden_layers = [i if i >= 0 else n_layers + i for i in hidden_layers]
 
-    # Each pair has a part1 and part2.
-    # This can be (positive, negative), or (negative, positive)
-    # At the end we correct this by flipping signs, so that the vector returned from this 'points' in the positive direction
-    flattened_strs = []
+    # Have to switch up order to get clean train for reader
+    train_strs = []
     for input in inputs:
         if input.flip:
-            flattened_strs += [
-                input.negative,
-                input.positive,
-            ]  # part1 = neg, part2 = pos
+            train_strs += [input.negative, input.positive]
+
         else:
-            flattened_strs += [input.positive, input.negative]
+            train_strs += [input.positive, input.negative]
 
     layer_hiddens = batched_get_hiddens(
-        model, tokenizer, flattened_strs, hidden_layers, batch_size
+        model, tokenizer, train_strs, hidden_layers, batch_size
     )
 
     if transform_hiddens is not None:
@@ -297,7 +293,7 @@ def read_representations(
         assert h.shape[0] == len(inputs) * 2
 
         if method == "pca_diff":
-            train = h[::2] - h[1::2]  # always part1 - part2
+            train = h[::2] - h[1::2]
         elif method == "pca_center":
             center = (h[::2] + h[1::2]) / 2
             train = h
@@ -309,32 +305,41 @@ def read_representations(
             raise ValueError("unknown method " + method)
 
         if method != "umap":
+            # shape (1, n_features)
             pca_model = PCA(n_components=1, whiten=False).fit(train)
+            # shape (n_features,)
             directions[layer] = pca_model.components_.astype(np.float32).squeeze(axis=0)
         else:
+            # still experimental so don't want to add this as a real dependency yet
             import umap  # type: ignore
 
             umap_model = umap.UMAP(n_components=1)
             embedding = umap_model.fit_transform(train).astype(np.float32)
             directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
 
+        # calculate sign
         projected_hiddens = project_onto_direction(h, directions[layer])
 
-        part1_higher = 0
-        part2_higher = 0
-        for i in range(0, len(projected_hiddens), 2):
-            p1 = projected_hiddens[i]
-            p2 = projected_hiddens[i + 1]
-            part1_higher += p1 > p2
-            part2_higher += p1 < p2
+        # Calculate the direction & signs
+        assert len(projected_hiddens) == len(inputs) * 2
 
-        if part1_higher > part2_higher:
-            # part1 projects higher than part2 ⇒ keep direction
-            signs[layer] = 1
-        else:
-            # part2 projects higher ⇒ flip
+        positive_smaller = 0
+        positive_larger = 0
+        for i, input in enumerate(inputs):
+            idx1, idx2 = 2 * i, 2 * i + 1
+            proj1, proj2 = projected_hiddens[idx1], projected_hiddens[idx2]
+
+            # Handle the .flip
+            pos_proj, neg_proj = (proj2, proj1) if input.flip else (proj1, proj2)
+
+            positive_smaller += pos_proj < neg_proj
+            positive_larger += pos_proj > neg_proj
+
+        if positive_smaller > positive_larger:
             directions[layer] *= -1
             signs[layer] = -1
+        else:
+            signs[layer] = 1
 
     return directions, signs
 
