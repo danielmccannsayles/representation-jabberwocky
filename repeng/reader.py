@@ -118,41 +118,27 @@ class PCARepReader:
         self.hidden_layers = hidden_layers
         self.signs = {}
 
-    def transform(self, hidden_states):
-        """Transform uses the directions. Direction signs are added on later"""
-
-        transformed_hidden_states = {}
-
-        for layer in self.hidden_layers:
-            layer_hidden_states = hidden_states[layer]
-
-            if hasattr(self, "H_train_means"):
-                layer_hidden_states = recenter(
-                    layer_hidden_states, mean=self.h_train_means[layer]
-                )
-
-            # project hidden states onto found concept directions (e.g. onto PCA comp 0)
-            H_transformed = project_onto_direction(
-                layer_hidden_states, self.directions[layer]
-            )
-            transformed_hidden_states[layer] = H_transformed
-        return transformed_hidden_states
-
     def read(
         self,
         input: str,
         mean_layers: range,
         batch_size,
     ):
-        """The actual load bearing call!
+        """
+        Consolidated version of the old `transform` + `read`.
 
-        Reads a string.
-        Goes through it and gets an h_test for each token ->. Then calculates scores according to rep_reader.
-        Takes in some input, runs it through the model, uses the rep_reader on it."""
+        For each token position:
+        1. Grab hidden state at that token (via `rep_token`).
+        2. (Optionally) recentre with the same means used in training.
+        3. Project onto the stored direction vectors.
+        4. Apply the stored sign.
+        5. Collect per‑layer scores and the mean across `mean_layers`.
+        """
         input_ids = self.tokenizer.tokenize(input)
-        results = []
 
-        # For each position (token index) we need to make H_tests
+        scores = []  # per‑token, per‑layer
+        score_means = []  # per‑token
+
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
 
@@ -166,24 +152,28 @@ class PCARepReader:
                 hide_progress=True,
             )
 
-            H_tests = self.transform(hidden_states)
+            per_layer_scores = []
+            per_layer_mean_pool = []
 
-            results.append(H_tests)
-
-        # Turn results into the scores & the mean scores
-        scores = []
-        score_means = []
-        for result in results:
-            mean_scores = []
-            normal_scores = []
             for layer in self.hidden_layers:
-                normal_scores.append(result[layer][0] * self.signs[layer])
+                layer_hidden = hidden_states[layer]
+
+                # Transform
+                if hasattr(self, "H_train_means"):
+                    layer_hidden = recenter(
+                        layer_hidden, mean=self.h_train_means[layer]
+                    )
+
+                projected = project_onto_direction(layer_hidden, self.directions[layer])
+
+                signed_score = projected[0] * self.signs[layer]
+                per_layer_scores.append(signed_score)
 
                 if layer in mean_layers:
-                    mean_scores.append(result[layer][0] * self.signs[layer])
+                    per_layer_mean_pool.append(signed_score)
 
-            scores.append(normal_scores)
-            score_means.append(np.mean(mean_scores))
+            scores.append(per_layer_scores)
+            score_means.append(np.mean(per_layer_mean_pool))
 
         return input_ids, scores, score_means
 
