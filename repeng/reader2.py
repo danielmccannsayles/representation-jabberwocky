@@ -1,6 +1,5 @@
 """
-DANIEL
-New strategy - implement the rep reading from the old code.
+The new version I made - so I can revert the old one
 """
 
 from itertools import islice
@@ -116,27 +115,6 @@ class PCARepReader:
         self.directions = {}
 
         self.hidden_layers = hidden_layers
-        self.signs = {}
-
-    def transform(self, hidden_states):
-        """Transform uses the directions. Direction signs are added on later"""
-
-        transformed_hidden_states = {}
-
-        for layer in self.hidden_layers:
-            layer_hidden_states = hidden_states[layer]
-
-            if hasattr(self, "H_train_means"):
-                layer_hidden_states = recenter(
-                    layer_hidden_states, mean=self.h_train_means[layer]
-                )
-
-            # project hidden states onto found concept directions (e.g. onto PCA comp 0)
-            H_transformed = project_onto_direction(
-                layer_hidden_states, self.directions[layer]
-            )
-            transformed_hidden_states[layer] = H_transformed
-        return transformed_hidden_states
 
     def read(
         self,
@@ -144,15 +122,16 @@ class PCARepReader:
         mean_layers: range,
         batch_size,
     ):
-        """The actual load bearing call!
-
-        Reads a string.
-        Goes through it and gets an h_test for each token ->. Then calculates scores according to rep_reader.
-        Takes in some input, runs it through the model, uses the rep_reader on it."""
+        """
+        For each token in the input:
+        - Gets hidden states at that position
+        - Projects them onto signed concept directions
+        - Directly collects per-token, per-layer scores and their mean
+        """
         input_ids = self.tokenizer.tokenize(input)
-        results = []
+        scores = []
+        score_means = []
 
-        # For each position (token index) we need to make H_tests
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
 
@@ -166,21 +145,22 @@ class PCARepReader:
                 hide_progress=True,
             )
 
-            H_tests = self.transform(hidden_states)
-
-            results.append(H_tests)
-
-        # Turn results into the scores & the mean scores
-        scores = []
-        score_means = []
-        for result in results:
-            mean_scores = []
             normal_scores = []
+            mean_scores = []
+
             for layer in self.hidden_layers:
-                normal_scores.append(result[layer][0] * self.signs[layer])
+                h = hidden_states[layer]
+
+                if hasattr(self, "h_train_means"):
+                    h = recenter(h, mean=self.h_train_means[layer])
+
+                direction = self.directions[layer]
+                score = project_onto_direction(h, direction)[0]
+
+                normal_scores.append(score)
 
                 if layer in mean_layers:
-                    mean_scores.append(result[layer][0] * self.signs[layer])
+                    mean_scores.append(score)
 
             scores.append(normal_scores)
             score_means.append(np.mean(mean_scores))
@@ -194,7 +174,7 @@ class PCARepReader:
     ):
         """Initializes the rep reader! Run this first"""
         # Only pca diff for now
-        directions, signs, h_train_means = read_representations(
+        directions, h_train_means = read_representations(
             self.model,
             self.tokenizer,
             train_inputs,
@@ -205,12 +185,8 @@ class PCARepReader:
         # TODO: switch to using the same layer convention (also stop hard-coding this value)
         transformed_directions = {-(32 - k): v for k, v in directions.items()}
         self.directions = transformed_directions
-
         transformed_means = {-(32 - k): v for k, v in h_train_means.items()}
         self.h_train_means = transformed_means
-
-        transformed_signs = {-(32 - k): -v for k, v in signs.items()}
-        self.signs = transformed_signs
 
     def reset_reader():
         """TODO: make this"""

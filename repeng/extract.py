@@ -1,6 +1,6 @@
 """
-
-Moved all the extract code here so I can revert extract.py"""
+extract
+"""
 
 import dataclasses
 import os
@@ -292,9 +292,13 @@ def read_representations(
     # get directions for each layer using PCA
     directions: dict[int, np.ndarray] = {}
     signs: dict[int, int] = {}
+    h_train_means: dict[int, np.ndarray] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
+
+        # Store the layerwise mean for later (used in rep reader)
+        h_train_means[layer] = h.mean(axis=0, keepdims=True)
 
         if method == "pca_diff":
             train = h[::2] - h[1::2]  # always part1 - part2
@@ -336,7 +340,7 @@ def read_representations(
             directions[layer] *= -1
             signs[layer] = -1
 
-    return directions, signs
+    return directions, signs, h_train_means
 
 
 def batched_get_hiddens(
