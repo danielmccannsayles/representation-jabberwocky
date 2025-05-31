@@ -3,16 +3,14 @@ DANIEL
 New strategy - implement the rep reading from the old code.
 """
 
-from itertools import islice
-from typing import Optional
-
 import numpy as np
 import torch
-import tqdm
-from sklearn.decomposition import PCA
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from repeng.extract import DatasetEntry, batched_get_hiddens, read_representations
+from repeng.extract import (
+    ControlVector,
+    batched_get_hiddens,
+)
 
 
 # Taken from repeng.
@@ -33,7 +31,7 @@ def project_onto_direction(H, direction):
 
 
 ### Actual class!
-class PCARepReader:
+class RepReader:
     def __init__(
         self,
         model: PreTrainedModel,
@@ -44,12 +42,10 @@ class PCARepReader:
         # The model & tokenizer should stay the same, since they're used to intialize the reader
         self.model = model
         self.tokenizer = tokenizer
-
-        # Directions are used in get_signs and in transform
-        self.directions = {}
-
         self.hidden_layers = hidden_layers
-        self.signs = {}
+
+        # Directions are used by reader
+        self.directions = {}
 
     def read(
         self,
@@ -102,21 +98,13 @@ class PCARepReader:
 
         return input_ids, scores, score_means
 
-    def initialize(
+    def set_vector(
         self,
-        train_inputs: list[DatasetEntry],
-        batch_size: int = 8,
+        vector: "ControlVector",
     ):
         """Initializes the rep reader! Run this first"""
-        # Only pca diff for now
-        directions = read_representations(
-            self.model,
-            self.tokenizer,
-            train_inputs,
-            self.hidden_layers,
-            batch_size,
-            "pca_diff",
-        )
+
+        directions = vector.directions
         # TODO: switch to using the same layer convention (also stop hard-coding this value)
         transformed_directions = {-(32 - k): v for k, v in directions.items()}
         self.directions = transformed_directions

@@ -1,141 +1,84 @@
 """
-The new version I made - so I can revert the old one
+New version - adds multiplier, means, uses the representation w/ updated sign/direction logic
 """
 
-from itertools import islice
 from typing import Optional
 
 import numpy as np
-import torch
-import tqdm
-from sklearn.decomposition import PCA
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from repeng.extract import DatasetEntry, read_representations
+from repeng.extract import ControlVector, batched_get_hiddens
+
+# # Taken from repeng.
+# def project_onto_direction(H, direction):
+#     """Project matrix H (n, d_1) onto direction vector (d_2,).
+
+#     Returns np"""
+#     # added this to avoid an error - don't know if these are supposed to be on CPU but whatever
+#     # TODO fix this upstream.
+#     if isinstance(H, torch.Tensor):
+#         H = H.cpu().numpy()
+#     if isinstance(direction, torch.Tensor):
+#         direction = direction.cpu().numpy()
+#     mag = np.linalg.norm(direction)
+#     print(f"multiplying {H.shape} by {direction.shape}, dividing by {mag.shape}")
+#     assert not np.isinf(mag)
+#     return (H @ direction) / mag
 
 
-### Helpers
-# Taken from repeng, slightly modified
-def batched_get_hiddens2(
-    model: PreTrainedModel,
-    tokenizer,
-    inputs: list[str],
-    hidden_layers: list[int],
-    batch_size: int,
-    rep_token: Optional[int] = None,
-    hide_progress: Optional[bool] = None,
-) -> dict[int, np.ndarray]:
-    """
-    Changed this to add a rep_token. This is necessary when reading w/ the reader (getting H_test).
-    If no rep token is passed it defaults to False, and uses the last non padding index
+class RepReader:
+    """Rep Reading class! The model & tokenizer will be used during reading (they're what the vectors will be pulled out of)"""
 
-    Also added hide_progress flag
-
-    Using the given model and tokenizer, pass the inputs through the model and get the hidden
-    states for each layer in `hidden_layers` for the last token.
-
-    Returns a dictionary from `hidden_layers` layer id to an numpy array of shape `(n_inputs, hidden_dim)`
-    """
-    batched_inputs = [
-        inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
-    ]
-    hidden_states = {layer: [] for layer in hidden_layers}
-
-    with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs, disable=hide_progress):
-            # get the last token, handling right padding if present
-            encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
-            encoded_batch = encoded_batch.to(model.device)
-            out = model(**encoded_batch, output_hidden_states=True)
-            attention_mask = encoded_batch["attention_mask"]
-
-            for i in range(len(batch)):
-                last_non_padding_index = (
-                    attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
-                )
-                token_index = last_non_padding_index if rep_token is None else rep_token
-
-                for layer in hidden_layers:
-                    hidden_idx = layer + 1 if layer >= 0 else layer
-                    hidden_state = (
-                        out.hidden_states[hidden_idx][i][token_index]
-                        .cpu()
-                        .float()
-                        .numpy()
-                    )
-                    hidden_states[layer].append(hidden_state)
-            del out
-
-    return {k: np.vstack(v) for k, v in hidden_states.items()}
-
-
-# Taken from repeng.
-def project_onto_direction(H, direction):
-    """Project matrix H (n, d_1) onto direction vector (d_2,).
-
-    Returns np"""
-    # added this to avoid an error - don't know if these are supposed to be on CPU but whatever
-    # TODO fix this upstream.
-    if isinstance(H, torch.Tensor):
-        H = H.cpu().numpy()
-    if isinstance(direction, torch.Tensor):
-        direction = direction.cpu().numpy()
-    mag = np.linalg.norm(direction)
-    print(f"multiplying {H.shape} by {direction.shape}, dividing by {mag.shape}")
-    assert not np.isinf(mag)
-    return (H @ direction) / mag
-
-
-def recenter(x, mean=None):
-    x = torch.Tensor(x).cuda()
-    if mean is None:
-        mean = torch.mean(x, axis=0, keepdims=True).cuda()
-    else:
-        mean = torch.Tensor(mean).cuda()
-    return x - mean
-
-
-### Actual class!
-class PCARepReader:
     def __init__(
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         hidden_layers: list[int],
     ):
-        super().__init__()
-        # The model & tokenizer should stay the same, since they're used to intialize the reader
         self.model = model
         self.tokenizer = tokenizer
+        self.hidden_layers = hidden_layers
 
-        # The means - used to recenter
+        # Directions & h_train_means come from control vector
+        self.directions = {}
         self.h_train_means = {}
 
-        # Directions are used in get_signs and in transform
-        self.directions = {}
-
-        self.hidden_layers = hidden_layers
+        # Multiplies the scores in read()
+        self.multiplier: Optional[float] = None
 
     def read(
         self,
         input: str,
         mean_layers: range,
-        batch_size,
+        batch_size: int,
+        multiplier: Optional[float] = None,
     ):
         """
         For each token in the input:
         - Gets hidden states at that position
         - Projects them onto signed concept directions
         - Directly collects per-token, per-layer scores and their mean
+
+        Mean layers: a set of layers to take the mean across. Usually used in sentence view
+        Accepts an optional multiplier. Not saved. Pass -1 to invert the concept direction
         """
-        input_ids = self.tokenizer.tokenize(input)
+        assert (
+            self.directions and self.h_train_means
+        ), "No direction/means. Run set_vector first!"
+
         scores = []
         score_means = []
 
+        # local > self > 1
+        multiplier = (
+            multiplier if multiplier else self.multiplier if self.multiplier else 1
+        )
+
+        input_ids = self.tokenizer.tokenize(input)
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
 
-            hidden_states = batched_get_hiddens2(
+            hidden_states = batched_get_hiddens(
                 self.model,
                 self.tokenizer,
                 inputs=[input],
@@ -149,13 +92,14 @@ class PCARepReader:
             mean_scores = []
 
             for layer in self.hidden_layers:
-                h = hidden_states[layer]
-
-                if hasattr(self, "h_train_means"):
-                    h = recenter(h, mean=self.h_train_means[layer])
-
                 direction = self.directions[layer]
-                score = project_onto_direction(h, direction)[0]
+                h = hidden_states[layer]
+                mean = self.h_train_means[layer]
+
+                # Re-center w/ h_train_means
+                h_centered = h - mean
+
+                score = float(h_centered @ direction) * multiplier
 
                 normal_scores.append(score)
 
@@ -167,27 +111,22 @@ class PCARepReader:
 
         return input_ids, scores, score_means
 
-    def initialize(
+    def set_vector(
         self,
-        train_inputs: list[DatasetEntry],
-        batch_size: int = 8,
+        vector: "ControlVector",
+        multiplier: Optional[float] = None,
     ):
-        """Initializes the rep reader! Run this first"""
-        # Only pca diff for now
-        directions, h_train_means = read_representations(
-            self.model,
-            self.tokenizer,
-            train_inputs,
-            self.hidden_layers,
-            batch_size,
-            "pca_diff",
-        )
+        """Initializes the rep reader with a control vector - this vector is used to isolate representations.
+
+        Optionally pass in a multiplier, to be used in read().
+        Set this to -1 to flip the concept direction.
+        Setting it here will set it for the RepReader instance"""
+        self.multiplier = multiplier
+        directions = vector.directions
+        h_train_means = vector.h_train_means
+
         # TODO: switch to using the same layer convention (also stop hard-coding this value)
         transformed_directions = {-(32 - k): v for k, v in directions.items()}
         self.directions = transformed_directions
         transformed_means = {-(32 - k): v for k, v in h_train_means.items()}
         self.h_train_means = transformed_means
-
-    def reset_reader():
-        """TODO: make this"""
-        pass

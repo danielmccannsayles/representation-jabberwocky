@@ -1,12 +1,14 @@
 """
-Newer version of extract. Moving here
+New version - updates read_reprsentation to
+1. calculate & return h_train_means
+2. Completely change how we calculate the directionality, from a poll to ideally ground-truth.
 """
 
 import dataclasses
 import os
 import typing
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import gguf
 import numpy as np
@@ -32,6 +34,7 @@ class DatasetEntry:
 class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
+    h_train_means: dict[int, np.ndarray]
 
     @classmethod
     def train(
@@ -58,13 +61,15 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, means = read_representations(
                 model,
                 tokenizer,
                 dataset,
                 **kwargs,
             )
-        return cls(model_type=model.config.model_type, directions=dirs)
+        return cls(
+            model_type=model.config.model_type, directions=dirs, h_train_means=means
+        )
 
     @classmethod
     def train_with_sae(
@@ -108,7 +113,7 @@ class ControlVector:
             return sae_hiddens
 
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, _ = read_representations(
                 model,
                 tokenizer,
                 dataset,
@@ -258,9 +263,15 @@ def read_representations(
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
-):
+) -> Tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     """
-    Extract the representations based on the contrast dataset.
+    Extract concept directions for contrasting pairs.
+    For every layer, return a 1‑D direction *unit* vector that scores
+    the *positive* text higher than the *negative* text.
+
+    • pca_diff   – train rows are (positive − negative); sign fixed implicitly
+    • pca_center – train rows are centered points; sign fixed by mean_delta test
+    • umap       – raw/centered rows; sign fixed by mean_delta test
     """
     if not hidden_layers:
         hidden_layers = range(-1, -model.config.num_hidden_layers, -1)
@@ -269,84 +280,87 @@ def read_representations(
     n_layers = len(model_layer_list(model))
     hidden_layers = [i if i >= 0 else n_layers + i for i in hidden_layers]
 
-    # Each pair has a part1 and part2.
-    # This can be (positive, negative), or (negative, positive)
-    # At the end we correct this by flipping signs, so that the vector returned from this 'points' in the positive direction
+    # Flip is necessary to prevent PCA from learning order
+    # Record the flip into pos_mask - we will use this at the end to make sure that directions point towards positive
     flattened_strs = []
+    pos_mask = []  # True -> positive
     for input in inputs:
         if input.flip:
             flattened_strs += [
                 input.negative,
                 input.positive,
-            ]  # part1 = neg, part2 = pos
+            ]
+            pos_mask += [False, True]
         else:
             flattened_strs += [input.positive, input.negative]
+            pos_mask += [True, False]
+
+    pos_mask = np.asarray(pos_mask, dtype=bool)
 
     layer_hiddens = batched_get_hiddens(
         model, tokenizer, flattened_strs, hidden_layers, batch_size
     )
-
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    # get directions for each layer using PCA
     directions: dict[int, np.ndarray] = {}
     h_train_means: dict[int, np.ndarray] = {}
-
-    for layer in tqdm.tqdm(hidden_layers):
-        h = layer_hiddens[layer]
+    for layer in tqdm.tqdm(hidden_layers, desc="fitting directions"):
+        h = layer_hiddens[layer]  # (2*N, d)
+        pos = h[pos_mask]  # (N, d)
+        neg = h[~pos_mask]  # (N, d)
         assert h.shape[0] == len(inputs) * 2
 
-        # Store the layerwise mean for later (used in rep reader)
-        h_train_means[layer] = h.mean(axis=0, keepdims=True)
+        # Use this later to recenter direction (for reader)
+        h_train_means[layer] = h.mean(axis=0).astype(np.float32)
 
         if method == "pca_diff":
-            train = h[::2] - h[1::2]  # always part1 - part2
+            train = pos - neg  # Sign fixed (pos-neg)
         elif method == "pca_center":
-            center = (h[::2] + h[1::2]) / 2
-            train = h
-            train[::2] -= center
-            train[1::2] -= center
+            center = (pos + neg) / 2
+            train = np.vstack((pos - center, neg - center))
         elif method == "umap":
-            train = h
+            train = np.vstack((pos, neg))
         else:
             raise ValueError("unknown method " + method)
 
         if method != "umap":
-            pca_model = PCA(n_components=1, whiten=False).fit(train)
-            directions[layer] = pca_model.components_.astype(np.float32).squeeze(axis=0)
+            pca = PCA(n_components=1, whiten=False).fit(train)
+            v = pca.components_[0].astype(np.float32)
         else:
             import umap  # type: ignore
 
-            umap_model = umap.UMAP(n_components=1)
-            embedding = umap_model.fit_transform(train).astype(np.float32)
-            directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
+            emb = umap.UMAP(n_components=1).fit_transform(train).astype(np.float32)
+            v = (train * emb).sum(axis=0) / emb.sum()
+            v = v.astype(np.float32)
 
-        projected_hiddens = project_onto_direction(h, directions[layer])
+        # Check if direction is pointing wrong way & correct it (only needed for non pca-diff but doesn't hurt)
+        # This replaces the not perfect check of project_onto_direction
+        mean_delta = (pos - neg).mean(axis=0)
+        if mean_delta @ v < 0:
+            v = -v
 
-        part1_higher = 0
-        part2_higher = 0
-        for i in range(0, len(projected_hiddens), 2):
-            p1 = projected_hiddens[i]
-            p2 = projected_hiddens[i + 1]
-            part1_higher += p1 > p2
-            part2_higher += p1 < p2
-
-        # If inverted
-        if part1_higher < part2_higher:
-            directions[layer] = -directions[layer]  # Important to do this explicitly
+        # Unit vector
+        directions[layer] = v / np.linalg.norm(v)
 
     return directions, h_train_means
 
 
 def batched_get_hiddens(
-    model,
+    model: PreTrainedModel,
     tokenizer,
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
+    rep_token: Optional[int] = None,
+    hide_progress: Optional[bool] = None,
 ) -> dict[int, np.ndarray]:
     """
+    Changed this to add a rep_token. This is necessary when reading w/ the reader (getting H_test).
+    If no rep token is passed it defaults to False, and uses the last non padding index
+
+    Also added hide_progress flag
+
     Using the given model and tokenizer, pass the inputs through the model and get the hidden
     states for each layer in `hidden_layers` for the last token.
 
@@ -356,21 +370,25 @@ def batched_get_hiddens(
         inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
     ]
     hidden_states = {layer: [] for layer in hidden_layers}
+
     with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs):
+        for batch in tqdm.tqdm(batched_inputs, disable=hide_progress):
             # get the last token, handling right padding if present
             encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
             encoded_batch = encoded_batch.to(model.device)
             out = model(**encoded_batch, output_hidden_states=True)
             attention_mask = encoded_batch["attention_mask"]
+
             for i in range(len(batch)):
                 last_non_padding_index = (
                     attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
                 )
+                token_index = last_non_padding_index if rep_token is None else rep_token
+
                 for layer in hidden_layers:
                     hidden_idx = layer + 1 if layer >= 0 else layer
                     hidden_state = (
-                        out.hidden_states[hidden_idx][i][last_non_padding_index]
+                        out.hidden_states[hidden_idx][i][token_index]
                         .cpu()
                         .float()
                         .numpy()
@@ -379,10 +397,3 @@ def batched_get_hiddens(
             del out
 
     return {k: np.vstack(v) for k, v in hidden_states.items()}
-
-
-def project_onto_direction(H, direction):
-    """Project matrix H (n, d_1) onto direction vector (d_2,)"""
-    mag = np.linalg.norm(direction)
-    assert not np.isinf(mag)
-    return (H @ direction) / mag
