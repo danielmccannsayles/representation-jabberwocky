@@ -344,13 +344,20 @@ def read_representations(
 
 
 def batched_get_hiddens(
-    model,
+    model: PreTrainedModel,
     tokenizer,
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
+    rep_token: Optional[int] = None,
+    hide_progress: Optional[bool] = None,
 ) -> dict[int, np.ndarray]:
     """
+    Changed this to add a rep_token. This is necessary when reading w/ the reader (getting H_test).
+    If no rep token is passed it defaults to False, and uses the last non padding index
+
+    Also added hide_progress flag
+
     Using the given model and tokenizer, pass the inputs through the model and get the hidden
     states for each layer in `hidden_layers` for the last token.
 
@@ -360,21 +367,25 @@ def batched_get_hiddens(
         inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
     ]
     hidden_states = {layer: [] for layer in hidden_layers}
+
     with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs):
+        for batch in tqdm.tqdm(batched_inputs, disable=hide_progress):
             # get the last token, handling right padding if present
             encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
             encoded_batch = encoded_batch.to(model.device)
             out = model(**encoded_batch, output_hidden_states=True)
             attention_mask = encoded_batch["attention_mask"]
+
             for i in range(len(batch)):
                 last_non_padding_index = (
                     attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
                 )
+                token_index = last_non_padding_index if rep_token is None else rep_token
+
                 for layer in hidden_layers:
                     hidden_idx = layer + 1 if layer >= 0 else layer
                     hidden_state = (
-                        out.hidden_states[hidden_idx][i][last_non_padding_index]
+                        out.hidden_states[hidden_idx][i][token_index]
                         .cpu()
                         .float()
                         .numpy()

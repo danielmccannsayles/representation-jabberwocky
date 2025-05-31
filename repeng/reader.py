@@ -12,62 +12,7 @@ import tqdm
 from sklearn.decomposition import PCA
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from repeng.extract import DatasetEntry, read_representations
-
-
-### Helpers
-# Taken from repeng, slightly modified
-def batched_get_hiddens2(
-    model: PreTrainedModel,
-    tokenizer,
-    inputs: list[str],
-    hidden_layers: list[int],
-    batch_size: int,
-    rep_token: Optional[int] = None,
-    hide_progress: Optional[bool] = None,
-) -> dict[int, np.ndarray]:
-    """
-    Changed this to add a rep_token. This is necessary when reading w/ the reader (getting H_test).
-    If no rep token is passed it defaults to False, and uses the last non padding index
-
-    Also added hide_progress flag
-
-    Using the given model and tokenizer, pass the inputs through the model and get the hidden
-    states for each layer in `hidden_layers` for the last token.
-
-    Returns a dictionary from `hidden_layers` layer id to an numpy array of shape `(n_inputs, hidden_dim)`
-    """
-    batched_inputs = [
-        inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
-    ]
-    hidden_states = {layer: [] for layer in hidden_layers}
-
-    with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs, disable=hide_progress):
-            # get the last token, handling right padding if present
-            encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
-            encoded_batch = encoded_batch.to(model.device)
-            out = model(**encoded_batch, output_hidden_states=True)
-            attention_mask = encoded_batch["attention_mask"]
-
-            for i in range(len(batch)):
-                last_non_padding_index = (
-                    attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
-                )
-                token_index = last_non_padding_index if rep_token is None else rep_token
-
-                for layer in hidden_layers:
-                    hidden_idx = layer + 1 if layer >= 0 else layer
-                    hidden_state = (
-                        out.hidden_states[hidden_idx][i][token_index]
-                        .cpu()
-                        .float()
-                        .numpy()
-                    )
-                    hidden_states[layer].append(hidden_state)
-            del out
-
-    return {k: np.vstack(v) for k, v in hidden_states.items()}
+from repeng.extract import DatasetEntry, batched_get_hiddens, read_representations
 
 
 # Taken from repeng.
@@ -85,15 +30,6 @@ def project_onto_direction(H, direction):
     print(f"multiplying {H.shape} by {direction.shape}, dividing by {mag.shape}")
     assert not np.isinf(mag)
     return (H @ direction) / mag
-
-
-def recenter(x, mean=None):
-    x = torch.Tensor(x).cuda()
-    if mean is None:
-        mean = torch.mean(x, axis=0, keepdims=True).cuda()
-    else:
-        mean = torch.Tensor(mean).cuda()
-    return x - mean
 
 
 ### Actual class!
@@ -142,7 +78,7 @@ class PCARepReader:
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
 
-            hidden_states = batched_get_hiddens2(
+            hidden_states = batched_get_hiddens(
                 self.model,
                 self.tokenizer,
                 inputs=[input],
@@ -158,12 +94,20 @@ class PCARepReader:
             for layer in self.hidden_layers:
                 layer_hidden = hidden_states[layer]
 
-                # Transform
-                if hasattr(self, "H_train_means"):
-                    layer_hidden = recenter(
-                        layer_hidden, mean=self.h_train_means[layer]
-                    )
+                # Recenter layer_hidden if we have the 'means' (pun intended)
+                if self.h_train_means:
+                    mean = torch.Tensor(self.h_train_means[layer]).to(self.model.device)
+                    layer_hidden = torch.Tensor(layer_hidden).to(self.model.device)
 
+                    # If no mean for layer, we just re-calculate it? Idk just preserving functionality
+                    if mean is None:
+                        mean = torch.mean(layer_hidden, axis=0, keepdims=True).to(
+                            self.model.device
+                        )
+
+                    layer_hidden = layer_hidden - mean
+
+                # Transform
                 projected = project_onto_direction(layer_hidden, self.directions[layer])
 
                 signed_score = projected[0] * self.signs[layer]
