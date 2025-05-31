@@ -291,7 +291,6 @@ def read_representations(
 
     # get directions for each layer using PCA
     directions: dict[int, np.ndarray] = {}
-    signs: dict[int, int] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
@@ -328,15 +327,11 @@ def read_representations(
             part1_higher += p1 > p2
             part2_higher += p1 < p2
 
-        if part1_higher > part2_higher:
-            # part1 projects higher than part2 ⇒ keep direction
-            signs[layer] = 1
-        else:
-            # part2 projects higher ⇒ flip
+        # Flipped
+        if part1_higher < part2_higher:
             directions[layer] *= -1
-            signs[layer] = -1
 
-    return directions, signs
+    return directions
 
 
 def batched_get_hiddens(

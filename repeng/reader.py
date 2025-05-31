@@ -58,19 +58,14 @@ class PCARepReader:
         batch_size,
     ):
         """
-        Consolidated version of the old `transform` + `read`.
-
-        For each token position:
-        1. Grab hidden state at that token (via `rep_token`).
-        2. (Optionally) recentre with the same means used in training.
-        3. Project onto the stored direction vectors.
-        4. Apply the stored sign.
-        5. Collect per‑layer scores and the mean across `mean_layers`.
+        For each token in the input:
+        - Gets hidden states at that position
+        - Projects them onto signed concept directions
+        - Directly collects per-token, per-layer scores and their mean
         """
         input_ids = self.tokenizer.tokenize(input)
-
-        scores = []  # per‑token, per‑layer
-        score_means = []  # per‑token
+        scores = []
+        score_means = []
 
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
@@ -85,26 +80,25 @@ class PCARepReader:
                 hide_progress=True,
             )
 
-            per_layer_scores = []
-            per_layer_mean_pool = []
+            normal_scores = []
+            mean_scores = []
 
             for layer in self.hidden_layers:
-                layer_hidden = hidden_states[layer]
+                h = hidden_states[layer]
 
-                # TODO: explore recentering here - doesn't seem to be needed but may provide a clearer picture?
+                # TODO: explore recentering h here - doesn't seem to be needed but may provide a clearer picture?
                 # Original uses h_train_means to do this..
 
-                # Transform
-                projected = project_onto_direction(layer_hidden, self.directions[layer])
+                direction = self.directions[layer]
+                score = project_onto_direction(h, direction)[0]
 
-                signed_score = projected[0] * self.signs[layer]
-                per_layer_scores.append(signed_score)
+                normal_scores.append(score)
 
                 if layer in mean_layers:
-                    per_layer_mean_pool.append(signed_score)
+                    mean_scores.append(score)
 
-            scores.append(per_layer_scores)
-            score_means.append(np.mean(per_layer_mean_pool))
+            scores.append(normal_scores)
+            score_means.append(np.mean(mean_scores))
 
         return input_ids, scores, score_means
 
@@ -115,7 +109,7 @@ class PCARepReader:
     ):
         """Initializes the rep reader! Run this first"""
         # Only pca diff for now
-        directions, signs = read_representations(
+        directions = read_representations(
             self.model,
             self.tokenizer,
             train_inputs,
@@ -126,9 +120,6 @@ class PCARepReader:
         # TODO: switch to using the same layer convention (also stop hard-coding this value)
         transformed_directions = {-(32 - k): v for k, v in directions.items()}
         self.directions = transformed_directions
-
-        transformed_signs = {-(32 - k): -v for k, v in signs.items()}
-        self.signs = transformed_signs
 
     def reset_reader():
         """TODO: make this"""
