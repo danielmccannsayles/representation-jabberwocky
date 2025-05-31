@@ -45,9 +45,6 @@ class PCARepReader:
         self.model = model
         self.tokenizer = tokenizer
 
-        # The means - used to recenter
-        self.h_train_means = {}
-
         # Directions are used in get_signs and in transform
         self.directions = {}
 
@@ -94,18 +91,8 @@ class PCARepReader:
             for layer in self.hidden_layers:
                 layer_hidden = hidden_states[layer]
 
-                # Recenter layer_hidden if we have the 'means' (pun intended)
-                if self.h_train_means:
-                    mean = torch.Tensor(self.h_train_means[layer]).to(self.model.device)
-                    layer_hidden = torch.Tensor(layer_hidden).to(self.model.device)
-
-                    # If no mean for layer, we just re-calculate it? Idk just preserving functionality
-                    if mean is None:
-                        mean = torch.mean(layer_hidden, axis=0, keepdims=True).to(
-                            self.model.device
-                        )
-
-                    layer_hidden = layer_hidden - mean
+                # TODO: explore recentering here - doesn't seem to be needed but may provide a clearer picture?
+                # Original uses h_train_means to do this..
 
                 # Transform
                 projected = project_onto_direction(layer_hidden, self.directions[layer])
@@ -128,7 +115,7 @@ class PCARepReader:
     ):
         """Initializes the rep reader! Run this first"""
         # Only pca diff for now
-        directions, signs, h_train_means = read_representations(
+        directions, signs = read_representations(
             self.model,
             self.tokenizer,
             train_inputs,
@@ -139,9 +126,6 @@ class PCARepReader:
         # TODO: switch to using the same layer convention (also stop hard-coding this value)
         transformed_directions = {-(32 - k): v for k, v in directions.items()}
         self.directions = transformed_directions
-
-        transformed_means = {-(32 - k): v for k, v in h_train_means.items()}
-        self.h_train_means = transformed_means
 
         transformed_signs = {-(32 - k): -v for k, v in signs.items()}
         self.signs = transformed_signs
