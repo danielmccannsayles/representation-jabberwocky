@@ -13,23 +13,6 @@ from repeng.extract import (
 )
 
 
-# Taken from repeng.
-def project_onto_direction(H, direction):
-    """Project matrix H (n, d_1) onto direction vector (d_2,).
-
-    Returns np"""
-    # added this to avoid an error - don't know if these are supposed to be on CPU but whatever
-    # TODO fix this upstream.
-    if isinstance(H, torch.Tensor):
-        H = H.cpu().numpy()
-    if isinstance(direction, torch.Tensor):
-        direction = direction.cpu().numpy()
-    mag = np.linalg.norm(direction)
-    print(f"multiplying {H.shape} by {direction.shape}, dividing by {mag.shape}")
-    assert not np.isinf(mag)
-    return (H @ direction) / mag
-
-
 ### Actual class!
 class RepReader:
     def __init__(
@@ -81,13 +64,12 @@ class RepReader:
 
             for layer in self.hidden_layers:
                 h = hidden_states[layer]
+                direction = self.directions[layer]
 
                 # TODO: explore recentering h here - doesn't seem to be needed but may provide a clearer picture?
                 # Original uses h_train_means to do this..
 
-                direction = self.directions[layer]
-                score = project_onto_direction(h, direction)[0]
-
+                score = float(h @ direction)
                 normal_scores.append(score)
 
                 if layer in mean_layers:
