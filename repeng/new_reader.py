@@ -1,5 +1,5 @@
 """
-I've been trying to replicate the original paper, but I'm not sure its reader is correct or super useful.
+From scratch reader - most up to date as of June 2
 """
 
 from dataclasses import dataclass
@@ -7,11 +7,13 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 
 ### Simplified batched_get_hiddens
+# Not actually used here - eventually will move this to  extract
 def batched_get_hiddens(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -29,7 +31,7 @@ def batched_get_hiddens(
 
     hiddens_by_layer = None  # Reassign once in loop
     with torch.no_grad():
-        for batch in tqdm(batched_inputs):
+        for batch in tqdm(batched_inputs, desc="Getting hidden states"):
             toks = tokenizer(batch, padding=True, return_tensors="pt").to(model.device)
             mask = toks["attention_mask"]
 
@@ -84,22 +86,6 @@ class DatasetEntry:
     negative: str
 
 
-def read_representations(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
-    dataset: list[DatasetEntry],
-    batch_size: int = 32,
-):
-    """Get a concept vector using the provided contrasting data set"""
-    # TODO: make train_strs out of dataset
-    # Dataset has a positive & a negative string
-    hiddens_by_layer = batched_get_hiddens(model, tokenizer, train_strs, batch_size)
-
-    #
-    for layer_idx, hiddens in tqdm(hiddens_by_layer.items()):
-        pass
-
-
 ### Reader class!
 class NewReader:
     def __init__(
@@ -107,12 +93,13 @@ class NewReader:
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
     ):
-        super().__init__()
         self.model = model
         self.tokenizer = tokenizer
 
         # Concept directions
         self.concept_directions = {}
+        # Used to recenter directions
+        self.means = {}
 
     def read(
         self,
@@ -120,7 +107,9 @@ class NewReader:
         mean_layers: range,
     ):
         """
-        Reads a string. Returns scores
+        Reads a string. Returns scores.
+
+        mean_layers are certain layers we want to take the mean of..
 
         For each token in the input:
         - Gets hidden states at that position
@@ -134,35 +123,35 @@ class NewReader:
         for pos in range(len(input_ids)):
             rep_token = -len(input_ids) + pos
 
-            hidden_states = get_hiddens_at_token(
+            hiddens_by_layer = get_hiddens_at_token(
                 self.model, self.tokenizer, input, rep_token
             )
 
             normal_scores = []
             mean_scores = []
+            for layer_idx, hiddens in hiddens_by_layer.items():
+                mean = self.means[layer_idx]
+                centered_hiddens = hiddens - mean
 
-            for layer in self.hidden_layers:
-                h = hidden_states[layer]
-                direction = self.directions[layer]
+                direction = self.concept_directions[layer_idx]
 
-                score = float(h @ direction)
+                # Project hiddens onto direction
+                score = float(centered_hiddens @ direction)
                 normal_scores.append(score)
 
-                if layer in mean_layers:
+                if layer_idx in mean_layers:
                     mean_scores.append(score)
 
+            # Add scores, calculate mean for mean scores
             scores.append(normal_scores)
             score_means.append(np.mean(mean_scores))
 
         return input_ids, scores, score_means
 
-    def set_vector(self, directions: dict[int, np.ndarray]):
-        """Sets a direciton vector."""
-
-        # TODO: switch to using the same layer convention (also stop hard-coding this value)
-        transformed_directions = {-(32 - k): v for k, v in directions.items()}
-        self.directions = transformed_directions
-
-    def reset_reader():
-        """TODO: make this"""
-        pass
+    def train_vector(self, dataset: list[DatasetEntry], batch_size: int = 32):
+        """Sets a direction vector."""
+        concept_directions, means = read_representations(
+            self.model, self.tokenizer, dataset, batch_size
+        )
+        self.concept_directions = concept_directions
+        self.means = means

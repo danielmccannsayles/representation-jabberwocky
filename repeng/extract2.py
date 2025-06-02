@@ -1,13 +1,11 @@
 """
-New version - updates read_reprsentation to
-1. calculate & return h_train_means
-2. Completely change how we calculate the directionality, from a poll to ideally ground-truth.
+extract
 """
 
-import dataclasses
 import os
 import typing
 import warnings
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import gguf
@@ -21,20 +19,19 @@ from .control import ControlModel, model_layer_list
 from .saes import Sae
 
 
-@dataclasses.dataclass
+@dataclass
 class DatasetEntry:
     positive: str
     negative: str
-    flip: Optional[bool] = None
-    # If true, flip the data. Used in training to avoid overfitting to pairs
-    # TODO: This is necessary for the rep reader - is it necessary for control?
 
 
-@dataclasses.dataclass
+@dataclass
 class ControlVector:
     model_type: str
-    directions: dict[int, np.ndarray]
-    h_train_means: dict[int, np.ndarray]
+    # Raw positive direction:
+    steering_directions: dict[int, np.ndarray]
+    # Signed for positive scores:
+    reading_directions: dict[int, np.ndarray]
 
     @classmethod
     def train(
@@ -61,14 +58,16 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs, means = read_representations(
+            steering_dirs, reading_dirs = read_representations(
                 model,
                 tokenizer,
                 dataset,
                 **kwargs,
             )
         return cls(
-            model_type=model.config.model_type, directions=dirs, h_train_means=means
+            model_type=model.config.model_type,
+            reading_directions=reading_dirs,
+            steering_directions=steering_dirs,
         )
 
     @classmethod
@@ -113,7 +112,7 @@ class ControlVector:
             return sae_hiddens
 
         with torch.inference_mode():
-            dirs, _ = read_representations(
+            steering_dirs, _ = read_representations(
                 model,
                 tokenizer,
                 dataset,
@@ -124,12 +123,12 @@ class ControlVector:
 
             final_dirs = {}
             if decode:
-                for k, v in tqdm.tqdm(dirs.items(), desc="sae decoding"):
+                for k, v in tqdm.tqdm(steering_dirs.items(), desc="sae decoding"):
                     final_dirs[k] = sae.layers[k].decode(v)
             else:
-                final_dirs = dirs
+                final_dirs = steering_dirs
 
-        return cls(model_type=model.config.model_type, directions=final_dirs)
+        return cls(model_type=model.config.model_type, steering_directions=final_dirs)
 
     def export_gguf(self, path: os.PathLike[str] | str):
         """
@@ -265,85 +264,86 @@ def read_representations(
     ) = None,
 ) -> Tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     """
-    Extract concept directions for contrasting pairs.
-    For every layer, return a 1‑D direction *unit* vector that scores
-    the *positive* text higher than the *negative* text.
-
-    • pca_diff   – train rows are (positive − negative); sign fixed implicitly
-    • pca_center – train rows are centered points; sign fixed by mean_delta test
-    • umap       – raw/centered rows; sign fixed by mean_delta test
+    Extract the representations based on the contrast dataset.
+    Returns steering directions, reading directions
     """
     if not hidden_layers:
         hidden_layers = range(-1, -model.config.num_hidden_layers, -1)
-
     # normalize the layer indexes if they're negative
     n_layers = len(model_layer_list(model))
     hidden_layers = [i if i >= 0 else n_layers + i for i in hidden_layers]
-
-    # Flip is necessary to prevent PCA from learning order
-    # Record the flip into pos_mask - we will use this at the end to make sure that directions point towards positive
-    flattened_strs = []
-    pos_mask = []  # True -> positive
-    for input in inputs:
-        if input.flip:
-            flattened_strs += [
-                input.negative,
-                input.positive,
-            ]
-            pos_mask += [False, True]
-        else:
-            flattened_strs += [input.positive, input.negative]
-            pos_mask += [True, False]
-
-    pos_mask = np.asarray(pos_mask, dtype=bool)
-
+    # the order is [positive, negative, positive, negative, ...]
+    train_strs = [s for ex in inputs for s in (ex.positive, ex.negative)]
     layer_hiddens = batched_get_hiddens(
-        model, tokenizer, flattened_strs, hidden_layers, batch_size
+        model, tokenizer, train_strs, hidden_layers, batch_size
     )
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    directions: dict[int, np.ndarray] = {}
-    h_train_means: dict[int, np.ndarray] = {}
-    for layer in tqdm.tqdm(hidden_layers, desc="fitting directions"):
-        h = layer_hiddens[layer]  # (2*N, d)
-        pos = h[pos_mask]  # (N, d)
-        neg = h[~pos_mask]  # (N, d)
+    steering_directions: dict[int, np.ndarray] = {}
+    reading_directions: dict[int, np.ndarray] = {}
+
+    for layer in tqdm.tqdm(hidden_layers):
+        h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
 
-        # Use this later to recenter direction (for reader)
-        h_train_means[layer] = h.mean(axis=0).astype(np.float32)
-
         if method == "pca_diff":
-            train = pos - neg  # Sign fixed (pos-neg)
+            train = h[::2] - h[1::2]  # positive - negative
         elif method == "pca_center":
-            center = (pos + neg) / 2
-            train = np.vstack((pos - center, neg - center))
+            center = (h[::2] + h[1::2]) / 2
+            train = h
+            train[::2] -= center
+            train[1::2] -= center
         elif method == "umap":
-            train = np.vstack((pos, neg))
+            train = h
         else:
             raise ValueError("unknown method " + method)
 
         if method != "umap":
-            pca = PCA(n_components=1, whiten=False).fit(train)
-            v = pca.components_[0].astype(np.float32)
+            pca_model = PCA(n_components=1, whiten=False).fit(train)
+            base_direction = pca_model.components_.astype(np.float32).squeeze(axis=0)
         else:
             import umap  # type: ignore
 
-            emb = umap.UMAP(n_components=1).fit_transform(train).astype(np.float32)
-            v = (train * emb).sum(axis=0) / emb.sum()
-            v = v.astype(np.float32)
+            umap_model = umap.UMAP(n_components=1)
+            embedding = umap_model.fit_transform(train).astype(np.float32)
+            base_direction = np.sum(train * embedding, axis=0) / np.sum(embedding)
 
-        # Check if direction is pointing wrong way & correct it (only needed for non pca-diff but doesn't hurt)
-        # This replaces the not perfect check of project_onto_direction
-        mean_delta = (pos - neg).mean(axis=0)
-        if mean_delta @ v < 0:
-            v = -v
+        # Project all examples onto the base direction
+        projected_hiddens = project_onto_direction(h, base_direction)
 
-        # Unit vector
-        directions[layer] = v / np.linalg.norm(v)
+        # STEERING DIRECTION: Should point from negative to positive
+        # Check if positive examples score higher than negative
+        positive_higher_mean = np.mean(
+            [
+                projected_hiddens[i] > projected_hiddens[i + 1]
+                for i in range(0, len(inputs) * 2, 2)
+            ]
+        )
 
-    return directions, h_train_means
+        # If positive examples don't score higher, flip the direction
+        steering_direction = base_direction.copy()
+        if positive_higher_mean < 0.5:
+            steering_direction *= -1
+
+        # READING DIRECTION: Should give positive scores for positive examples
+        # Re-project with the steering direction to get correct signs
+        projected_with_steering = project_onto_direction(h, steering_direction)
+
+        # For reading, we want positive examples to have positive scores
+        positive_scores = [
+            projected_with_steering[i] for i in range(0, len(inputs) * 2, 2)
+        ]
+        mean_positive_score = np.mean(positive_scores)
+
+        reading_direction = steering_direction.copy()
+        if mean_positive_score < 0:
+            reading_direction *= -1
+
+        steering_directions[layer] = steering_direction
+        reading_directions[layer] = reading_direction
+
+    return (steering_directions, reading_directions)
 
 
 def batched_get_hiddens(
@@ -397,3 +397,10 @@ def batched_get_hiddens(
             del out
 
     return {k: np.vstack(v) for k, v in hidden_states.items()}
+
+
+def project_onto_direction(H, direction):
+    """Project matrix H (n, d_1) onto direction vector (d_2,)"""
+    mag = np.linalg.norm(direction)
+    assert not np.isinf(mag)
+    return (H @ direction) / mag

@@ -45,24 +45,6 @@ class ControlModel(torch.nn.Module):
     @property
     def device(self) -> torch.device:
         return self.model.device
-    
-    def set_control_layers(self, layer_ids: list[int]):
-        """On an existing model, set layer_ids."""
-        # First unwrap all layers
-        self.unwrap()
-
-        # Then re-init
-        layers = model_layer_list(self.model)
-        self.layer_ids = [i if i >= 0 else len(layers) + i for i in layer_ids] # neg or pos
-        for layer_id in layer_ids:
-            layer = layers[layer_id]
-            if not isinstance(layer, ControlModule):
-                layers[layer_id] = ControlModule(layer)
-            else:
-                warnings.warn(
-                    "Trying to rewrap a wrapped model! Probably not what you want! Try calling .unwrap first."
-                )
-
 
     def unwrap(self) -> PreTrainedModel:
         """
@@ -72,9 +54,7 @@ class ControlModel(torch.nn.Module):
 
         layers = model_layer_list(self.model)
         for layer_id in self.layer_ids:
-            layer = layers[layer_id]
-            if isinstance(layer, ControlModule):
-                layer = layer.block
+            layers[layer_id] = layers[layer_id].block
         return self.model
 
     def set_control(
