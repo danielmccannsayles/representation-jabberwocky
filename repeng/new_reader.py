@@ -11,6 +11,8 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
+from repeng.extract import ControlVector
+
 
 ### Simplified batched_get_hiddens
 # Not actually used here - eventually will move this to  extract
@@ -79,13 +81,6 @@ def get_hiddens_at_token(
     return hiddens_by_layer
 
 
-### Concept vector stuff
-@dataclass
-class DatasetEntry:
-    positive: str
-    negative: str
-
-
 ### Reader class!
 class NewReader:
     def __init__(
@@ -98,8 +93,6 @@ class NewReader:
 
         # Concept directions
         self.concept_directions = {}
-        # Used to recenter directions
-        self.means = {}
 
     def read(
         self,
@@ -148,10 +141,13 @@ class NewReader:
 
         return input_ids, scores, score_means
 
-    def train_vector(self, dataset: list[DatasetEntry], batch_size: int = 32):
+    def set_vector(
+        self,
+        vector: "ControlVector",
+        multiplier: Optional[float] = None,
+    ):
         """Sets a direction vector."""
-        concept_directions, means = read_representations(
-            self.model, self.tokenizer, dataset, batch_size
-        )
-        self.concept_directions = concept_directions
-        self.means = means
+        directions = vector.directions
+        # TODO: any processing + multiplier?? here
+
+        self.concept_directions = directions
