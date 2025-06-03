@@ -1,5 +1,12 @@
 """
 From scratch reader - most up to date as of June 2
+
+Some assumptions:
+
+Default control:
+1. To match w/ control I'm assuming `normalize` is false (so the layer's activation is not rescaled after)
+2. Assuming that the operator for adding the direction vector is +.
+
 """
 
 from dataclasses import dataclass
@@ -63,9 +70,10 @@ def get_hiddens_at_token(
     """
     Passes a string input through model, returning hidden activations for each transformer layer
     at the specified token position.
-    Returns a dict mapping layer index (0 = first transformer layer)
+    Returns a dict mapping layer index (1 = first transformer layer)
     to a (hidden_dim,) array.
     """
+
     with torch.no_grad():
         toks = tokenizer(input, return_tensors="pt").to(model.device)
 
@@ -74,9 +82,9 @@ def get_hiddens_at_token(
         del out
 
         hiddens_by_layer = {}
-        for layer in range(1, len(hs)):
+        for layer in range(1, len(hs) - 1):
             vec = hs[layer][0][rep_token].cpu().float().numpy()
-            hiddens_by_layer[layer - 1] = vec
+            hiddens_by_layer[layer] = vec
 
     return hiddens_by_layer
 
@@ -94,6 +102,9 @@ class NewReader:
         # Concept directions
         self.concept_directions = {}
 
+        # Baseline (mean) (used to get accurate reading)
+        self.baseline = {}
+
     def read(
         self,
         input: str,
@@ -106,7 +117,7 @@ class NewReader:
 
         For each token in the input:
         - Gets hidden states at that position
-        - Projects them onto signed concept directions
+        - Projects them onto normalized concept directions
         - Directly collects per-token, per-layer scores and their mean
         """
         input_ids = self.tokenizer.tokenize(input)
@@ -123,13 +134,17 @@ class NewReader:
             normal_scores = []
             mean_scores = []
             for layer_idx, hiddens in hiddens_by_layer.items():
-                mean = self.means[layer_idx]
-                centered_hiddens = hiddens - mean
-
                 direction = self.concept_directions[layer_idx]
+                baseline = self.baseline[layer_idx]
 
-                # Project hiddens onto direction
-                score = float(centered_hiddens @ direction)
+                # Center hiddens
+                centered_hiddens = hiddens - baseline
+
+                # Get unit direction out of concept direction
+                unit_direction = direction / np.linalg.norm(direction)
+
+                # Project centered hiddens onto the unit direction
+                score = float(centered_hiddens @ unit_direction)
                 normal_scores.append(score)
 
                 if layer_idx in mean_layers:
@@ -144,10 +159,13 @@ class NewReader:
     def set_vector(
         self,
         vector: "ControlVector",
-        multiplier: Optional[float] = None,
+        coeff: Optional[float] = 1,
     ):
-        """Sets a direction vector."""
-        directions = vector.directions
-        # TODO: any processing + multiplier?? here
+        """Sets a direction vector. Multiplies it by coeff to match the control.
 
-        self.concept_directions = directions
+        You should set this to an empiricially validated coeff"""
+        directions = vector.directions
+        baseline = vector.baseline
+
+        self.concept_directions = {k: v * coeff for k, v in directions.items()}
+        self.baseline = baseline

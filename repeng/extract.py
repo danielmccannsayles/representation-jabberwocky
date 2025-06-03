@@ -24,6 +24,7 @@ class DatasetEntry:
 class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
+    baseline: dict[int, np.ndarray]
 
     @classmethod
     def train(
@@ -50,13 +51,15 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, baseline = read_representations(
                 model,
                 tokenizer,
                 dataset,
                 **kwargs,
             )
-        return cls(model_type=model.config.model_type, directions=dirs)
+        return cls(
+            model_type=model.config.model_type, directions=dirs, baseline=baseline
+        )
 
     @classmethod
     def train_with_sae(
@@ -100,7 +103,7 @@ class ControlVector:
             return sae_hiddens
 
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, baseline = read_representations(
                 model,
                 tokenizer,
                 dataset,
@@ -116,7 +119,9 @@ class ControlVector:
             else:
                 final_dirs = dirs
 
-        return cls(model_type=model.config.model_type, directions=final_dirs)
+        return cls(
+            model_type=model.config.model_type, directions=final_dirs, baseline=baseline
+        )
 
     def export_gguf(self, path: os.PathLike[str] | str):
         """
@@ -250,9 +255,13 @@ def read_representations(
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
-) -> dict[int, np.ndarray]:
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     """
     Extract the representations based on the contrast dataset.
+
+    Returns (directions, baseline).
+
+    Baseline is needed for an accurate reading.
     """
     if not hidden_layers:
         hidden_layers = range(-1, -model.config.num_hidden_layers, -1)
@@ -271,39 +280,43 @@ def read_representations(
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    # get directions for each layer using PCA
     directions: dict[int, np.ndarray] = {}
+    baselines: dict[int, np.ndarray] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
 
+        pos = h[::2]
+        neg = h[1::2]
+        center = (pos.mean(0) + neg.mean(0)) / 2
+        baselines[layer] = center
+
         if method == "pca_diff":
-            train = h[::2] - h[1::2]
+            train = pos - neg
         elif method == "pca_center":
-            center = (h[::2] + h[1::2]) / 2
-            train = h
-            train[::2] -= center
-            train[1::2] -= center
+            train = h - center
         elif method == "umap":
             train = h
         else:
             raise ValueError("unknown method " + method)
 
+        # Fit 1d direction
         if method != "umap":
             # shape (1, n_features)
             pca_model = PCA(n_components=1, whiten=False).fit(train)
             # shape (n_features,)
-            directions[layer] = pca_model.components_.astype(np.float32).squeeze(axis=0)
+            dir = pca_model.components_.astype(np.float32).squeeze(axis=0)
         else:
             # still experimental so don't want to add this as a real dependency yet
             import umap  # type: ignore
 
             umap_model = umap.UMAP(n_components=1)
             embedding = umap_model.fit_transform(train).astype(np.float32)
-            directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
+            dir = np.sum(train * embedding, axis=0) / np.sum(embedding)
 
-        # calculate sign
-        projected_hiddens = project_onto_direction(h, directions[layer])
+        # calculate sign so pos > neg
+        hiddens_to_project = train if method == "pca_center" else h
+        projected_hiddens = project_onto_direction(hiddens_to_project, dir)
 
         # order is [positive, negative, positive, negative, ...]
         positive_smaller_mean = np.mean(
@@ -320,9 +333,11 @@ def read_representations(
         )
 
         if positive_smaller_mean > positive_larger_mean:  # type: ignore
-            directions[layer] *= -1
+            dir *= -1
 
-    return directions
+        directions[layer] = dir.astype(np.float32)
+
+    return directions, baselines
 
 
 def batched_get_hiddens(
