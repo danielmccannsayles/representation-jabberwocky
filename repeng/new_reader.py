@@ -99,8 +99,9 @@ class NewReader:
         self.model = model
         self.tokenizer = tokenizer
 
-        # Concept directions
-        self.concept_directions = {}
+        # Seperate pos & neg since they can have different empiric coeffs
+        self.pos_concept_directions = {}
+        self.neg_concept_directions = {}
 
         # Baseline (mean) (used to get accurate reading)
         self.baseline = {}
@@ -134,19 +135,26 @@ class NewReader:
             normal_scores = []
             mean_scores = []
             for layer_idx, hiddens in hiddens_by_layer.items():
-                direction = self.concept_directions[layer_idx]
+                pos_direction = self.pos_concept_directions[layer_idx]
+                neg_direction = self.neg_concept_directions[layer_idx]
                 baseline = self.baseline[layer_idx]
 
-                # Center hiddens
                 centered_hiddens = hiddens - baseline
 
-                # Get unit direction out of concept direction
-                unit_direction = direction / np.linalg.norm(direction)
+                # Calculate cosine similarities to both directions
+                pos_similarity = np.dot(centered_hiddens, pos_direction) / (
+                    np.linalg.norm(centered_hiddens) * np.linalg.norm(pos_direction)
+                    + 1e-8
+                )
+                neg_similarity = np.dot(centered_hiddens, neg_direction) / (
+                    np.linalg.norm(centered_hiddens) * np.linalg.norm(neg_direction)
+                    + 1e-8
+                )
 
-                # Project centered hiddens onto the unit direction
-                score = float(centered_hiddens @ unit_direction)
+                # Score is the difference - its positive when closer to pos_direction
+                score = float(pos_similarity - neg_similarity)
+
                 normal_scores.append(score)
-
                 if layer_idx in mean_layers:
                     mean_scores.append(score)
 
@@ -159,13 +167,16 @@ class NewReader:
     def set_vector(
         self,
         vector: "ControlVector",
-        coeff: Optional[float] = 1,
+        pos_coeff: Optional[float] = 1,
+        neg_coeff: Optional[float] = -1,
     ):
-        """Sets a direction vector. Multiplies it by coeff to match the control.
+        """Sets a direction vector.
+        Multiplies it by coeff to match the control.
 
         You should set this to an empiricially validated coeff"""
         directions = vector.directions
         baseline = vector.baseline
 
-        self.concept_directions = {k: v * coeff for k, v in directions.items()}
+        self.pos_concept_directions = {k: v * pos_coeff for k, v in directions.items()}
+        self.neg_concept_directions = {k: v * neg_coeff for k, v in directions.items()}
         self.baseline = baseline
