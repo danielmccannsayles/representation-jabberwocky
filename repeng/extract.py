@@ -12,6 +12,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .control import ControlModel, model_layer_list
 from .saes import Sae
+from typing import Optional
 
 
 @dataclasses.dataclass
@@ -24,7 +25,7 @@ class DatasetEntry:
 class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
-    baseline: dict[int, np.ndarray]
+    baseline: Optional[dict[int, np.ndarray]] = None
 
     @classmethod
     def train(
@@ -295,26 +296,16 @@ def read_representations(
             train = pos - neg
         elif method == "pca_center":
             train = h - center
-        elif method == "umap":
-            train = h
         else:
-            raise ValueError("unknown method " + method)
+            raise ValueError("unknown method (removed umap for now) " + method)
 
-        # Fit 1d direction
-        if method != "umap":
-            # shape (1, n_features)
-            pca_model = PCA(n_components=1, whiten=False).fit(train)
-            # shape (n_features,)
-            dir = pca_model.components_.astype(np.float32).squeeze(axis=0)
-        else:
-            # still experimental so don't want to add this as a real dependency yet
-            import umap  # type: ignore
+  
+        # shape (1, n_features)
+        pca_model = PCA(n_components=1, whiten=False).fit(train)
+        # shape (n_features,)
+        dir = pca_model.components_.astype(np.float32).squeeze(axis=0)
 
-            umap_model = umap.UMAP(n_components=1)
-            embedding = umap_model.fit_transform(train).astype(np.float32)
-            dir = np.sum(train * embedding, axis=0) / np.sum(embedding)
-
-        # calculate sign so pos > neg
+        ## calculate sign of the direction so pos > neg
         hiddens_to_project = train if method == "pca_center" else h
         projected_hiddens = project_onto_direction(hiddens_to_project, dir)
 
@@ -331,10 +322,8 @@ def read_representations(
                 for i in range(0, len(inputs) * 2, 2)
             ]
         )
-
         if positive_smaller_mean > positive_larger_mean:  # type: ignore
             dir *= -1
-
         directions[layer] = dir.astype(np.float32)
 
     return directions, baselines
