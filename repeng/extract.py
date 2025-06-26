@@ -26,6 +26,9 @@ class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
     baseline: Optional[dict[int, np.ndarray]] = None
+    positives: Optional[dict[int, np.ndarray]] = None
+    negatives: Optional[dict[int, np.ndarray]] = None
+    directional_baseline: Optional[dict[int, float]] = None
 
     @classmethod
     def train(
@@ -52,14 +55,14 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs, baseline = read_representations(
+            dirs, baseline, positives, negatives, directional_baseline = read_representations(
                 model,
                 tokenizer,
                 dataset,
                 **kwargs,
             )
         return cls(
-            model_type=model.config.model_type, directions=dirs, baseline=baseline
+            model_type=model.config.model_type, directions=dirs, baseline=baseline, positives=positives, negatives=negatives, directional_baseline=directional_baseline
         )
 
     @classmethod
@@ -104,7 +107,7 @@ class ControlVector:
             return sae_hiddens
 
         with torch.inference_mode():
-            dirs, baseline = read_representations(
+            dirs, baseline, _ , _, _  = read_representations(
                 model,
                 tokenizer,
                 dataset,
@@ -200,7 +203,7 @@ class ControlVector:
                 directions[layer] = other_layer
         return ControlVector(model_type=model_type, directions=directions)
 
-    def __eq__(self, other: "ControlVector") -> bool:
+    def __eq__(self, other: "ControlVector") -> bool: # type: ignore
         if self is other:
             return True
 
@@ -256,7 +259,7 @@ def read_representations(
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
-) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray],  dict[int, np.ndarray],  dict[int, np.ndarray], dict[int, float]]:
     """
     Extract the representations based on the contrast dataset.
 
@@ -283,6 +286,9 @@ def read_representations(
 
     directions: dict[int, np.ndarray] = {}
     baselines: dict[int, np.ndarray] = {}
+    directional_baseline: dict[int, float] = {}
+    positives: dict[int, np.ndarray] = {}
+    negatives: dict[int, np.ndarray] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
@@ -291,6 +297,8 @@ def read_representations(
         neg = h[1::2]
         center = (pos.mean(0) + neg.mean(0)) / 2
         baselines[layer] = center
+        positives[layer] = pos
+        negatives[layer] = neg
 
         if method == "pca_diff":
             train = pos - neg
@@ -304,6 +312,9 @@ def read_representations(
         pca_model = PCA(n_components=1, whiten=False).fit(train)
         # shape (n_features,)
         dir = pca_model.components_.astype(np.float32).squeeze(axis=0)
+
+        # # normalize the direction
+        # dir = dir / np.linalg.norm(dir)
 
         ## calculate sign of the direction so pos > neg
         hiddens_to_project = train if method == "pca_center" else h
@@ -326,7 +337,12 @@ def read_representations(
             dir *= -1
         directions[layer] = dir.astype(np.float32)
 
-    return directions, baselines
+        # Let's test out a scalar center for a better baseline
+        proj_pos = pos @ dir
+        proj_neg = neg @ dir
+        directional_baseline[layer] = float(proj_pos.mean(0) + proj_neg.mean(0)) / 2
+
+    return directions, baselines, positives, negatives, directional_baseline
 
 
 def batched_get_hiddens(
@@ -376,3 +392,4 @@ def project_onto_direction(H, direction):
     mag = np.linalg.norm(direction)
     assert not np.isinf(mag)
     return (H @ direction) / mag
+
